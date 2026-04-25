@@ -311,14 +311,20 @@ def main(gpu, cfg):
     epoch_train_time = AverageMeter()
 
     # resume from checkpoint
+    resume_checkpoint = None
     if 'ckpt_path' in cfg.keys() and cfg.ckpt_path is not None and os.path.isfile(cfg.ckpt_path):
-        logger.debug(f'---> loading {cfg.resume} <---')
+        logger.debug(f'---> loading {cfg.ckpt_path} <---')
         checkpoint = torch.load(cfg.ckpt_path, map_location=f'cuda:{gpu}')
         q_model.load_state_dict(checkpoint['model_state_dict'])
+        if 'k_model_state_dict' in checkpoint:
+            k_model.load_state_dict(checkpoint['k_model_state_dict'])
+        else:
+            k_model.load_state_dict(q_model.state_dict())
         optim.load_state_dict(checkpoint['optim_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_accuracy = checkpoint['best_accuracy']
         best_epoch = checkpoint['best_epoch']
+        resume_checkpoint = checkpoint
     else:
         start_epoch = 0
         best_accuracy = 0.0
@@ -341,9 +347,21 @@ def main(gpu, cfg):
     tau_c, tau_o = torch.zeros(cfg.n_classes).to(device), torch.zeros(cfg.n_classes).to(device)
 
     scaler = GradScaler()
+    if resume_checkpoint is not None:
+        if 'queue_keys' in resume_checkpoint:
+            queue_keys = resume_checkpoint['queue_keys'].to(device)
+        if 'queue_logits' in resume_checkpoint:
+            queue_logits = resume_checkpoint['queue_logits'].to(device)
+        queue_ptr = resume_checkpoint.get('queue_ptr', queue_ptr)
+        if 'tau_c' in resume_checkpoint:
+            tau_c = resume_checkpoint['tau_c'].to(device)
+        if 'tau_o' in resume_checkpoint:
+            tau_o = resume_checkpoint['tau_o'].to(device)
+        if 'scaler_state_dict' in resume_checkpoint:
+            scaler.load_state_dict(resume_checkpoint['scaler_state_dict'])
     for epoch in range(start_epoch, cfg.epochs):
         if cfg.warmup_fc_only:
-            if epoch == 0:
+            if epoch < cfg.warmup_epochs:
                 freeze_layer(q_model.encoder)
             elif epoch == cfg.warmup_epochs:
                 unfreeze_layer(q_model.encoder)
@@ -567,7 +585,14 @@ def main(gpu, cfg):
             save_checkpoint({
                 'epoch': epoch,
                 'model_state_dict': q_model.state_dict(),
+                'k_model_state_dict': k_model.state_dict(),
                 'optim_state_dict': optim.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'queue_keys': queue_keys.detach().cpu(),
+                'queue_logits': queue_logits.detach().cpu(),
+                'queue_ptr': queue_ptr,
+                'tau_c': tau_c.detach().cpu(),
+                'tau_o': tau_o.detach().cpu(),
                 'best_epoch': best_epoch,
                 'best_accuracy': best_accuracy
             }, filename=os.path.join(result_dir, f'checkpoint-{ckpt_file_suffix}.pth'))
@@ -660,6 +685,7 @@ def parse_args():
     parser.add_argument('--cfg', type=str, required=True, help='configuration file path')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--data-root', type=str, default=None)
     # Args: network & optimization
     parser.add_argument('--arch', type=str, default=None)
     parser.add_argument('--warmup-fc-only', action='store_true')

@@ -26,5 +26,5 @@ CUDA_VISIBLE_DEVICES=${GPU} python main.py --seed ${SEED} \
         --arch resnet50 --opt sgd --batch-size 32 --lr 0.005 --warmup-lr 0.005 --lr-decay cosine:10,1e-8,110 --weight-decay 3e-4 --eps 0.1 --epochs 120 \
         --warmup-epochs 5 --fdim 512 --hdim 2 --queue-length 32000 --knet-m 0.99 --transform strong \
         --alpha ${ALPHA} --beta ${BETA} --gamma ${GAMMA} --n-neighbors ${N} --topK ${TOPK} --topK-decay ${TOPKD} --delta ${DELTA} --tau-m ${TAU_M} \
-        --cls4ood nl --cls4id ce --ncr-lossfun kldiv --integrate-mode or --ood-criterion div --threshold-generator per_class_mean \
+        --cls4ood nl --cls4id ce --ncr-lossfunc kldiv --integrate-mode or --ood-criterion div --threshold-generator per_class_mean \
         --save-model --enable-progress-bar True --eval-det 0 --benchmark --conf-weight

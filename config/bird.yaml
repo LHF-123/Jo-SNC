@@ -6,12 +6,12 @@ rescale_size: 448
 crop_size: 448
 
 # network & optimization
-arch: resnet18
+arch: resnet50
 opt: sgd
 batch_size: 64
 epochs: 120
 lr: 0.01
-lr_decay: cosine:5,0.0,100
+lr_decay: cosine:10
 warmup_epochs: 5
 warmup_lr: 0.01
 warmup_lr_plan: constant
@@ -20,7 +20,15 @@ use_fp16: True
 
 # hyper-params
 eps: 0.3
-alpha: 0.1
+alpha: 0.3
+beta: 0.8
+gamma: 0.001
+fdim: 512
+queue_length: 32000
+n_neighbors: 10
+topK: 10
+tau_m: 0.98
+# Warmup omega_tau is fixed to 0.75 in main.py.
 
 # logging
 log_root: ../results/

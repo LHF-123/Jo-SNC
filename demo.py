@@ -54,8 +54,11 @@ if __name__ == '__main__':
     parser.add_argument('--model-path', type=str, required=True)
     parser.add_argument('--arch', type=str, default='')
     parser.add_argument('--gpu', type=str, default=0)
+    parser.add_argument('--data-root', type=str, default=None)
     args = parser.parse_args()
     dataset_cfg = edict(yaml.load(open(args.cfg, 'r'), Loader=yaml.FullLoader))
+    if args.data_root is not None:
+        dataset_cfg.data_root = args.data_root
 
     set_seed(0)
     device = torch.device(f'cuda:{args.gpu}')
