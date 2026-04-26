@@ -241,6 +241,17 @@ def count_topk_label_matches(topk_indices, selected_positions, batch_indices, gt
     return int((selected_topk == selected_targets).any(dim=1).sum().item())
 
 
+def select_batch_indices(batch_indices, selected_positions):
+    # Sample-selection logs use dataset indices, while selected positions may be
+    # CUDA tensors from the model path. Normalize both before list conversion.
+    if selected_positions.numel() == 0:
+        return []
+
+    batch_indices = batch_indices.detach().cpu().long()
+    selected_positions = selected_positions.detach().cpu().long()
+    return batch_indices[selected_positions].numpy().tolist()
+
+
 def get_stats(result_file):
     with open(result_file, 'r') as f:
         lines = f.readlines()

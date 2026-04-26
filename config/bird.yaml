@@ -31,7 +31,7 @@ tau_m: 0.98
 # Warmup omega_tau is fixed to 0.75 in main.py.
 
 # logging
-log_root: ../results/
+log_root: ./results/
 log_proj: ''
 log_name: IterJoSRC
 

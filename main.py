@@ -515,9 +515,9 @@ def main(gpu, cfg):
                     logger.debug(f'  |- cls_clean: {l1:.3f}, cls_id: {l2:.6f}, cls_ood: {l3:.3f}, '
                                  f'con_feat: {loss_con_feat.item():.3f}, con_pred: {loss_con_pred.item():.3f}, ncr: {loss_ncr.item():.3f}')
 
-                    pr_indices_clean.extend(indices[idx_clean].cpu().numpy().tolist())
-                    pr_indices_id.extend(indices[idx_id].cpu().numpy().tolist())
-                    pr_indices_ood.extend(indices[idx_ood].cpu().numpy().tolist())
+                    pr_indices_clean.extend(select_batch_indices(indices, idx_clean))
+                    pr_indices_id.extend(select_batch_indices(indices, idx_id))
+                    pr_indices_ood.extend(select_batch_indices(indices, idx_ood))
 
                 # dequeue and enqueue
                 if queue_ptr + bs > cfg.queue_length:  # if last interation in each epoch is a small batch
