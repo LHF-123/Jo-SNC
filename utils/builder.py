@@ -72,21 +72,27 @@ class LazyRandAugmentPolicy(object):
         return self.policy(image)
 
 
-def build_transform(rescale_size=512, crop_size=448, dataset='imagenet'):
+def get_dataset_normalization(dataset='imagenet'):
+    # 可视化和训练 transform 共用同一组均值方差，避免反归一化图片颜色失真。
     if dataset.startswith('cifar100n') or dataset.startswith('cifar80n'):
-        normalization = torchvision.transforms.Normalize(mean=(0.5071, 0.4865, 0.4409), std=(0.2009, 0.1984, 0.2023))
+        return (0.5071, 0.4865, 0.4409), (0.2009, 0.1984, 0.2023)
     elif dataset == 'food101n':
-        normalization = torchvision.transforms.Normalize(mean=(0.5741, 0.4774, 0.3869), std=(0.2364, 0.2466, 0.2533))
+        return (0.5741, 0.4774, 0.3869), (0.2364, 0.2466, 0.2533)
     elif dataset == 'clothing1m':
-        normalization = torchvision.transforms.Normalize(mean=(0.7215, 0.6846, 0.6678), std=(0.2503, 0.2628, 0.2622))
+        return (0.7215, 0.6846, 0.6678), (0.2503, 0.2628, 0.2622)
     elif dataset == 'web-aircraft':
-        normalization = torchvision.transforms.Normalize(mean=(0.5108, 0.5413, 0.5649), std=(0.2062, 0.2038, 0.2209))
+        return (0.5108, 0.5413, 0.5649), (0.2062, 0.2038, 0.2209)
     elif dataset == 'web-bird':
-        normalization = torchvision.transforms.Normalize(mean=(0.5313, 0.5339, 0.4821), std=(0.1836, 0.1828, 0.1930))
+        return (0.5313, 0.5339, 0.4821), (0.1836, 0.1828, 0.1930)
     elif dataset == 'web-car':
-        normalization = torchvision.transforms.Normalize(mean=(0.4631, 0.4522, 0.4477), std=(0.2719, 0.2700, 0.2719))
+        return (0.4631, 0.4522, 0.4477), (0.2719, 0.2700, 0.2719)
     else:
-        normalization = torchvision.transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+
+
+def build_transform(rescale_size=512, crop_size=448, dataset='imagenet'):
+    norm_mean, norm_std = get_dataset_normalization(dataset)
+    normalization = torchvision.transforms.Normalize(mean=norm_mean, std=norm_std)
 
     train_transform = torchvision.transforms.Compose([
         torchvision.transforms.Resize(size=rescale_size),

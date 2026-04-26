@@ -44,7 +44,10 @@ def build_model(cfg, arch=''):
         arch = 'resnet50' if arch != 'InceptionResNetV2' else arch
     else:
         raise NotImplementedError(f'{cfg.dataset} is not supported.')
-    model = DualHeadModel(arch=arch, num_classes=cfg.n_classes, mlp_hidden=2, feature_dim=512, pretrained=False).to(device)
+    # Evaluation must mirror the training head dimensions saved in config.yaml.
+    mlp_hidden = getattr(cfg, 'hdim', 2)
+    feature_dim = getattr(cfg, 'fdim', 512)
+    model = DualHeadModel(arch=arch, num_classes=cfg.n_classes, mlp_hidden=mlp_hidden, feature_dim=feature_dim, pretrained=False).to(device)
     return model
 
 
@@ -61,7 +64,7 @@ if __name__ == '__main__':
         dataset_cfg.data_root = args.data_root
 
     set_seed(0)
-    device = torch.device(f'cuda:{args.gpu}')
+    device = torch.device(f'cuda:{str(args.gpu).strip()}')
 
     dataset = build_dataset(dataset_cfg)
     test_loader = DataLoader(dataset['test'], batch_size=128, shuffle=False, num_workers=8, pin_memory=True)

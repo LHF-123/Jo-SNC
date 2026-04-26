@@ -30,10 +30,11 @@ from tqdm import tqdm
 from sklearn.mixture import GaussianMixture
 from utils.logger import Logger, Writer
 from utils.model import Model, DualHeadModel
-from utils.builder import build_transform, build_cifar100n_dataset, build_webfg_dataset, build_food101n_dataset, build_clothing1m_dataset, build_mini_webvision_dataset, build_animal10n_dataset
+from utils.builder import build_transform, get_dataset_normalization, build_cifar100n_dataset, build_webfg_dataset, build_food101n_dataset, build_clothing1m_dataset, build_mini_webvision_dataset, build_animal10n_dataset
 from utils.eval import accuracy, evaluate, detection_evaluate
 from utils.utils import *
 from utils.loss import *
+from utils.local_evidence import LOCAL_EVIDENCE_CSV_HEADER, compute_local_evidence, format_local_evidence_row
 
 from PIL import ImageFile
 
@@ -212,6 +213,17 @@ def samples_identification(logits1, logits2, ob_labels, features, features_queue
     return idx_clean, idx_id, idx_ood, prob_clean, prob_ood
 
 
+def _should_run_local_evidence(cfg, epoch, batch_idx):
+    # A1 诊断按 epoch 间隔和 batch 上限抽样，避免可视化/CSV 记录拖慢完整训练。
+    if cfg.local_evidence_every <= 0:
+        return False
+    if (epoch % cfg.local_evidence_every) != 0:
+        return False
+    if cfg.local_evidence_max_batches > 0 and batch_idx >= cfg.local_evidence_max_batches:
+        return False
+    return True
+
+
 def generate_label_sets(batch_label_sets, nc):
     bs = batch_label_sets.size(0)
     label_sets = torch.zeros(bs, nc).to(batch_label_sets.device)
@@ -300,6 +312,15 @@ def main(gpu, cfg):
     threshold_writer = Writer(root_dir=result_dir, filename='threshold.csv', header='epoch,threshold_clean,threshold_ood')
     pr_metric_writer = Writer(root_dir=result_dir, filename='prfa_metric.csv', header='epoch,N,P,R,F1,AUROC,N,P,R,F1,AUROC,N,P,R,F1,AUROC')
     pll_topk_acc_writer = Writer(root_dir=result_dir, filename='pll_topk_acc.csv', header='epoch,top1AccID,topkAccID,top1AccOOD,topkAccOOD')
+    local_evidence_writer = None
+    local_evidence_image_dir = None
+    local_evidence_norm = None
+    if cfg.local_evidence:
+        local_evidence_writer = Writer(root_dir=result_dir, filename='local_evidence.csv', header=LOCAL_EVIDENCE_CSV_HEADER)
+        if cfg.local_evidence_save_images:
+            # 可视化图片使用当前数据集的均值方差反归一化，保存到本次实验目录下。
+            local_evidence_image_dir = os.path.join(result_dir, 'local_evidence_images')
+            local_evidence_norm = get_dataset_normalization(cfg.dataset)
     if 'webvision' in cfg.dataset:
         test_acc_writer = Writer(root_dir=result_dir, filename='test_acc.csv', header='epoch,Top1Acc,Top5Acc,ImagenetTop1Acc,ImagenetTop5Acc')
     else:
@@ -519,6 +540,29 @@ def main(gpu, cfg):
                     pr_indices_id.extend(select_batch_indices(indices, idx_id))
                     pr_indices_ood.extend(select_batch_indices(indices, idx_ood))
 
+                    if local_evidence_writer is not None and _should_run_local_evidence(cfg, epoch, it):
+                        # A1 只读诊断：使用 student/teacher 的当前输出记录证据，不改变原始 loss。
+                        diagnostic_model = k_model if cfg.local_evidence_use_teacher else q_model
+                        local_evidence_rows = compute_local_evidence(
+                            diagnostic_model, x1, y, indices, idx_clean, idx_id, idx_ood,
+                            epoch=epoch + 1,
+                            batch_idx=it,
+                            cam_quantile=cfg.local_evidence_cam_quantile,
+                            min_area=cfg.local_evidence_min_area,
+                            max_area=cfg.local_evidence_max_area,
+                            bbox_padding=cfg.local_evidence_bbox_padding,
+                            cam_type=cfg.local_evidence_cam_type,
+                            student_logits=logits1,
+                            teacher_logits=ema_logits1,
+                            save_images=cfg.local_evidence_save_images,
+                            image_dir=os.path.join(local_evidence_image_dir, f'epoch_{epoch + 1:03d}') if local_evidence_image_dir is not None else None,
+                            image_max_samples=cfg.local_evidence_image_max_samples,
+                            norm_mean=local_evidence_norm[0] if local_evidence_norm is not None else None,
+                            norm_std=local_evidence_norm[1] if local_evidence_norm is not None else None,
+                        )
+                        for row in local_evidence_rows:
+                            local_evidence_writer.write(format_local_evidence_row(row))
+
                 # dequeue and enqueue
                 if queue_ptr + bs > cfg.queue_length:  # if last interation in each epoch is a small batch
                     n_tailing = cfg.queue_length - queue_ptr
@@ -668,7 +712,12 @@ def check_args(args):
         'fdim', 'n_neighbors', 'tau_m', 'queue_length', 'knet_m', 'transform', 'topK', 'topK_decay', 'temp',
         'integrate_mode', 'ood_criterion', 'conf_weight', 'threshold_generator',
         'cls4id', 'cls4ood', 'ncr_lossfunc', 'predefined_tau_clean',
-        'eval_det', 'use_fp16', 'benchmark', 'ablation', 'save_model', 'save_ckpt'
+        'eval_det', 'use_fp16', 'benchmark', 'ablation', 'save_model', 'save_ckpt',
+        'local_evidence', 'local_evidence_every', 'local_evidence_max_batches',
+        'local_evidence_cam_quantile', 'local_evidence_use_teacher',
+        'local_evidence_min_area', 'local_evidence_max_area',
+        'local_evidence_bbox_padding', 'local_evidence_cam_type',
+        'local_evidence_save_images', 'local_evidence_image_max_samples'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -690,7 +739,7 @@ def parse_args():
     parser.add_argument('--arch', type=str, default=None)
     parser.add_argument('--warmup-fc-only', action='store_true')
     parser.add_argument('--hdim', type=float, default=2)
-    parser.add_argument('--fdim', type=int, default=256)
+    parser.add_argument('--fdim', type=int, default=None)
     parser.add_argument('--opt', type=str, default=None)
     parser.add_argument('--batch-size', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=None)
@@ -739,6 +788,18 @@ def parse_args():
     parser.add_argument('--threshold-generator', type=str, default='gmm')
     parser.add_argument('--conf-weight', action='store_true')
     parser.add_argument('--predefined-tau-clean', action='store_true')
+    # A1 局部证据诊断参数：默认只写 CSV，不额外加入 loss。
+    parser.add_argument('--local-evidence', action='store_true', default=None)
+    parser.add_argument('--local-evidence-every', type=int, default=None)
+    parser.add_argument('--local-evidence-max-batches', type=int, default=None)
+    parser.add_argument('--local-evidence-cam-quantile', type=float, default=None)
+    parser.add_argument('--local-evidence-use-teacher', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--local-evidence-min-area', type=float, default=None)
+    parser.add_argument('--local-evidence-max-area', type=float, default=None)
+    parser.add_argument('--local-evidence-bbox-padding', type=float, default=None)
+    parser.add_argument('--local-evidence-cam-type', type=str, default=None)
+    parser.add_argument('--local-evidence-save-images', action='store_true', default=None)
+    parser.add_argument('--local-evidence-image-max-samples', type=int, default=None)
 
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
@@ -746,6 +807,21 @@ def parse_args():
     parsed_args = {k: v for k, v in vars(parsed_args).items() if v is not None and k not in ['cfg', 'gpu']}
     args = yaml.load(open(cfg_path, 'r'), Loader=yaml.FullLoader)
     args.update(parsed_args)
+    # fdim 优先使用 YAML 或命令行显式值，仅在配置缺省时补默认值。
+    if args.get('fdim') is None:
+        args['fdim'] = 256
+    # A1 参数同样先尊重 YAML/命令行，缺省时再统一补默认值。
+    args.setdefault('local_evidence', False)
+    args.setdefault('local_evidence_every', 1)
+    args.setdefault('local_evidence_max_batches', 0)
+    args.setdefault('local_evidence_cam_quantile', 0.8)
+    args.setdefault('local_evidence_use_teacher', True)
+    args.setdefault('local_evidence_min_area', 0.05)
+    args.setdefault('local_evidence_max_area', 0.7)
+    args.setdefault('local_evidence_bbox_padding', 0.05)
+    args.setdefault('local_evidence_cam_type', 'weightcam')
+    args.setdefault('local_evidence_save_images', False)
+    args.setdefault('local_evidence_image_max_samples', 8)
     assert check_args(args)
     return gpu, edict(args)
 
