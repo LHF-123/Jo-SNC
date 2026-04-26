@@ -25,7 +25,7 @@ CUDA_VISIBLE_DEVICES=${GPU} python main.py --seed ${SEED} \
         --arch resnet50 --opt sgd --batch-size 64 --lr 0.01 --warmup-lr 0.01 --lr-decay step:30,60,80 --weight-decay 1e-4 --eps 0.5 --epochs 100 \
         --warmup-epochs 5 --fdim 512 --hdim 2 --queue-length 32000 --knet-m 0.99 --transform strong \
         --alpha ${ALPHA} --beta ${BETA} --gamma ${GAMMA} --n-neighbors ${N} --topK ${TOPK} --topK-decay ${TOPKD} --delta ${DELTA} --tau-m ${TAUM} \
-        --cls4ood nl --cls4id ce --ncr-lossfun kldiv --integrate-mode or --ood-criterion div --threshold-generator per_class_mean \
+        --cls4ood nl --cls4id ce --ncr-lossfunc kldiv --integrate-mode or --ood-criterion div --threshold-generator per_class_mean \
         --save-model --enable-progress-bar True --eval-det 0 --benchmark --warmup-fc-only   # --conf-weight
 
 export LOGNAME="inception_resnet_v2-topK${TOPK}_decay${TOPKD}-Knn${N}-ALPHA${ALPHA}-BETA${BETA}-GAMMA${GAMMA}-DELTA${DELTA}-TAUM${TAUM}-NoConfWeight"
@@ -34,5 +34,5 @@ CUDA_VISIBLE_DEVICES=${GPU} python main.py --seed ${SEED} \
         --arch InceptionResNetV2 --opt sgd --batch-size 64 --lr 0.01 --warmup-lr 0.01 --lr-decay step:20,40,60,80 --weight-decay 1e-4 --eps 0.5 --epochs 100 \
         --warmup-epochs 5 --fdim 512 --hdim 2 --queue-length 32000 --knet-m 0.99 --transform strong \
         --alpha ${ALPHA} --beta ${BETA} --gamma ${GAMMA} --n-neighbors ${N} --topK ${TOPK} --topK-decay ${TOPKD} --delta ${DELTA} --tau-m ${TAUM} \
-        --cls4ood nl --cls4id ce --ncr-lossfun kldiv --integrate-mode or --ood-criterion div --threshold-generator per_class_mean \
+        --cls4ood nl --cls4id ce --ncr-lossfunc kldiv --integrate-mode or --ood-criterion div --threshold-generator per_class_mean \
         --save-model --enable-progress-bar True --eval-det 0 --benchmark --warmup-fc-only   # --conf-weight

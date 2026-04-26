@@ -27,5 +27,5 @@ CUDA_VISIBLE_DEVICES=${GPU} python cifar.py --seed ${SEED} \
         --arch cnn --opt adam --lr 0.001 --warmup-lr 0.001 --lr-decay cosine:10 --warmup-lr-plan constant --weight-decay 0 \
         --warmup-epochs 10 --fdim 256 --hdim 2 --queue-length 32000 --knet-m 0.99 --transform strong \
         --alpha ${ALPHA} --beta ${BETA} --gamma ${GAMMA} --n-neighbors ${N} --topK ${TOPK} --topK-decay ${TOPKD} --delta ${DELTA} --tau-m ${TAU_M} \
-        --cls4ood nl --cls4id ce --ncr-lossfun kldiv --integrate-mode or --ood-criterion div --threshold-generator per_class_mean \
+        --cls4ood nl --cls4id ce --ncr-lossfunc kldiv --integrate-mode or --ood-criterion div --threshold-generator per_class_mean \
         --enable-progress-bar True --benchmark --conf-weight

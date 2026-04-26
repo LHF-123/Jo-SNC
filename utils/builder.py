@@ -15,12 +15,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
-from randaugment import CIFAR10Policy, ImageNetPolicy, Cutout, RandAugment
 from data.noisy_cifar import NoisyCIFAR10, NoisyCIFAR100
 from data.image_folder import IndexedImageFolder
 from data.food101 import Food101
 from data.food101n import Food101N
-from data.clothing1m import Clothing1M
 from data.webvision import webvision_dataset, imagenet_dataset
 from data.anmal10n import Animal10N
 from PIL import ImageFilter
@@ -40,6 +38,40 @@ class GaussianBlur(object):
         return x
 
 
+def _load_randaugment_policy(policy_name):
+    # randaugment==1.0.2 still uses np.int internally. Restore the alias only
+    # before constructing legacy policies so Python 3.12/new NumPy can run.
+    import numpy as np
+    if not hasattr(np, 'int'):
+        np.int = int
+
+    try:
+        from randaugment import CIFAR10Policy, RandAugment
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            'randaugment is required for strong data augmentation. Install it with requirements.txt.'
+        ) from exc
+
+    if policy_name == 'cifar10':
+        return CIFAR10Policy()
+    if policy_name == 'imagenet':
+        return RandAugment()
+    raise ValueError(f'{policy_name} randaugment policy is not supported.')
+
+
+class LazyRandAugmentPolicy(object):
+    # Delay legacy randaugment construction until a strong transform is used.
+    # Evaluation paths build transform dictionaries but only consume train/test.
+    def __init__(self, policy_name):
+        self.policy_name = policy_name
+        self.policy = None
+
+    def __call__(self, image):
+        if self.policy is None:
+            self.policy = _load_randaugment_policy(self.policy_name)
+        return self.policy(image)
+
+
 def build_transform(rescale_size=512, crop_size=448, dataset='imagenet'):
     if dataset.startswith('cifar100n') or dataset.startswith('cifar80n'):
         normalization = torchvision.transforms.Normalize(mean=(0.5071, 0.4865, 0.4409), std=(0.2009, 0.1984, 0.2023))
@@ -55,24 +87,6 @@ def build_transform(rescale_size=512, crop_size=448, dataset='imagenet'):
         normalization = torchvision.transforms.Normalize(mean=(0.4631, 0.4522, 0.4477), std=(0.2719, 0.2700, 0.2719))
     else:
         normalization = torchvision.transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-
-    cifar_train_transform = torchvision.transforms.Compose([
-        torchvision.transforms.RandomCrop(size=crop_size, padding=4),
-        torchvision.transforms.RandomHorizontalFlip(),
-        torchvision.transforms.ToTensor(),
-        normalization
-    ])
-    cifar_test_transform = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),
-        normalization
-    ])
-    cifar_train_transform_strong_aug = torchvision.transforms.Compose([
-        torchvision.transforms.RandomCrop(size=crop_size, padding=4),
-        torchvision.transforms.RandomHorizontalFlip(),
-        CIFAR10Policy(),
-        torchvision.transforms.ToTensor(),
-        normalization
-    ])
 
     train_transform = torchvision.transforms.Compose([
         torchvision.transforms.Resize(size=rescale_size),
@@ -91,26 +105,50 @@ def build_transform(rescale_size=512, crop_size=448, dataset='imagenet'):
         torchvision.transforms.Resize(size=rescale_size),
         torchvision.transforms.RandomHorizontalFlip(),
         torchvision.transforms.RandomCrop(size=crop_size),
-        RandAugment(),
+        LazyRandAugmentPolicy('imagenet'),
         torchvision.transforms.ToTensor(),
         normalization
     ])
 
-    train_transform_moco = torchvision.transforms.Compose([
-        torchvision.transforms.RandomResizedCrop(crop_size, scale=(0.2, 1.0)),
-        torchvision.transforms.RandomApply([
-            torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-        ], p=0.8),
-        torchvision.transforms.RandomGrayscale(p=0.2),
-        torchvision.transforms.RandomApply([GaussianBlur([0.1, 2.0])], p=0.5),
-        torchvision.transforms.RandomHorizontalFlip(),
-        torchvision.transforms.ToTensor(),
-        normalization
-    ])
+    transforms = {
+        'train': train_transform,
+        'test': test_transform,
+        'train_strong_aug': train_transform_strong_aug,
+    }
 
-    return {'train': train_transform, 'test': test_transform, 'train_strong_aug': train_transform_strong_aug,
-            'cifar_train': cifar_train_transform, 'cifar_test': cifar_test_transform, 'cifar_train_strong_aug': cifar_train_transform_strong_aug,
-            'train_moco': train_transform_moco}
+    if dataset.startswith('cifar100n') or dataset.startswith('cifar80n') or dataset == 'animal10n':
+        transforms['cifar_train'] = torchvision.transforms.Compose([
+            torchvision.transforms.RandomCrop(size=crop_size, padding=4),
+            torchvision.transforms.RandomHorizontalFlip(),
+            torchvision.transforms.ToTensor(),
+            normalization
+        ])
+        transforms['cifar_test'] = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            normalization
+        ])
+        transforms['cifar_train_strong_aug'] = torchvision.transforms.Compose([
+            torchvision.transforms.RandomCrop(size=crop_size, padding=4),
+            torchvision.transforms.RandomHorizontalFlip(),
+            LazyRandAugmentPolicy('cifar10'),
+            torchvision.transforms.ToTensor(),
+            normalization
+        ])
+
+    if dataset.startswith('cifar100n') or dataset.startswith('cifar80n'):
+        transforms['train_moco'] = torchvision.transforms.Compose([
+            torchvision.transforms.RandomResizedCrop(crop_size, scale=(0.2, 1.0)),
+            torchvision.transforms.RandomApply([
+                torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+            ], p=0.8),
+            torchvision.transforms.RandomGrayscale(p=0.2),
+            torchvision.transforms.RandomApply([GaussianBlur([0.1, 2.0])], p=0.5),
+            torchvision.transforms.RandomHorizontalFlip(),
+            torchvision.transforms.ToTensor(),
+            normalization
+        ])
+
+    return transforms
 
 
 def build_cifar10n_dataset(root, train_transform, test_transform, noise_type, openset_ratio, closeset_ratio):
@@ -149,6 +187,15 @@ def build_food101n_dataset(root, train_transform, test_transform):
 
 
 def build_clothing1m_dataset(root, train_transform, test_transform):
+    # Clothing1M support is optional; delay the import so other datasets can run
+    # when data/clothing1m.py is not included in the checkout.
+    try:
+        from data.clothing1m import Clothing1M
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            'Clothing1M was requested, but data/clothing1m.py is missing.'
+        ) from exc
+
     train_data = Clothing1M(root, split='train', transform=train_transform)
     valid_data = Clothing1M(root, split='val', transform=test_transform)
     test_data = Clothing1M(root, split='test', transform=test_transform)

@@ -12,8 +12,6 @@ import torch
 import torch.nn as nn
 import torchvision
 from utils.utils import init_weights
-from utils.pre_act_resnet import PreActResNet18Encoder
-from utils.InceptionResNetV2 import InceptionResNetV2, HF_InceptionResNetV2_Encoder
 
 
 class CNN(nn.Module):
@@ -101,6 +99,30 @@ class MLPHead(nn.Module):
         return self.mlp_head(x)
 
 
+def build_pre_act_resnet18_encoder():
+    # PreAct ResNet is an optional architecture; delay the import so ResNet50
+    # evaluation does not require utils/pre_act_resnet.py to exist.
+    try:
+        from utils.pre_act_resnet import PreActResNet18Encoder
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            'preact_resnet18 was requested, but utils/pre_act_resnet.py is missing.'
+        ) from exc
+    return PreActResNet18Encoder()
+
+
+def build_inception_resnet_v2_encoder():
+    # Inception-ResNet-v2 depends on timm; import it only when that backbone is
+    # selected so ResNet/VGG/CNN runs do not require the optional dependency.
+    try:
+        from utils.InceptionResNetV2 import HF_InceptionResNetV2_Encoder
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            'InceptionResNetV2 was requested, but its optional timm dependency is missing.'
+        ) from exc
+    return HF_InceptionResNetV2_Encoder(pretrained_weight_index=0)
+
+
 class Encoder(nn.Module):
     def __init__(self, arch='cnn', num_classes=200, pretrained=True):
         super().__init__()
@@ -109,11 +131,11 @@ class Encoder(nn.Module):
             self.encoder = nn.Sequential(*list(resnet.children())[:-1])
             self.feature_dim = resnet.fc.in_features
         elif arch.startswith('preact_resnet18'):
-            pre_act_resnet = PreActResNet18Encoder()
+            pre_act_resnet = build_pre_act_resnet18_encoder()
             self.encoder = pre_act_resnet.encoder
             self.feature_dim = 512
         elif arch == 'InceptionResNetV2':
-            self.encoder = HF_InceptionResNetV2_Encoder(pretrained_weight_index=0)  # InceptionResNetV2(mode='encoder')
+            self.encoder = build_inception_resnet_v2_encoder()
             self.feature_dim = self.encoder.feat_dim
         elif arch == 'vgg19_bn':
             self.encoder = VGG19BN_Encoder(pretrained=pretrained)
