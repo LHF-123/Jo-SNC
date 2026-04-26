@@ -227,6 +227,20 @@ def indices_list_to_indicator_vector(indices_list, num_samples):
     return indicator_vector
 
 
+def count_topk_label_matches(topk_indices, selected_positions, batch_indices, gt_labels):
+    # Metric bookkeeping can mix GPU selection masks with CPU dataset labels.
+    # Keep this indexing on CPU so CUDA training tensors are not moved globally.
+    if selected_positions.numel() == 0:
+        return 0
+
+    selected_positions = selected_positions.detach().cpu().long()
+    batch_indices = batch_indices.detach().cpu().long()
+    gt_labels = gt_labels.detach().cpu().long()
+    selected_topk = topk_indices.detach().cpu().long()[selected_positions]
+    selected_targets = gt_labels[batch_indices[selected_positions]].view(-1, 1)
+    return int((selected_topk == selected_targets).any(dim=1).sum().item())
+
+
 def get_stats(result_file):
     with open(result_file, 'r') as f:
         lines = f.readlines()

@@ -443,11 +443,11 @@ def main(gpu, cfg):
                         soft_labels = F.softmax(ema_logits1, dim=1)
                         if 1 < topK < cfg.n_classes:
                             _, topK_indices1 = soft_labels.topk(1, dim=1, largest=True, sorted=True)     # top1
-                            num_pll_top1_match_id += (topK_indices1[idx_id].cpu().long() == gt_train_labels[indices[idx_id]].unsqueeze(dim=1).repeat(1, 1).long()).any(dim=1).sum()
-                            num_pll_top1_match_ood += (topK_indices1[idx_ood].cpu().long() == gt_train_labels[indices[idx_ood]].unsqueeze(dim=1).repeat(1, 1).long()).any(dim=1).sum()
+                            num_pll_top1_match_id += count_topk_label_matches(topK_indices1, idx_id, indices, gt_train_labels)
+                            num_pll_top1_match_ood += count_topk_label_matches(topK_indices1, idx_ood, indices, gt_train_labels)
                             topK_probs, topK_indices1 = soft_labels.topk(topK, dim=1, largest=True, sorted=True)  # topK
-                            num_pll_topk_match_id += (topK_indices1[idx_id].cpu().long() == gt_train_labels[indices[idx_id]].unsqueeze(dim=1).repeat(1, topK).long()).any(dim=1).sum()
-                            num_pll_topk_match_ood += (topK_indices1[idx_ood].cpu().long() == gt_train_labels[indices[idx_ood]].unsqueeze(dim=1).repeat(1, 1).long()).any(dim=1).sum()
+                            num_pll_topk_match_id += count_topk_label_matches(topK_indices1, idx_id, indices, gt_train_labels)
+                            num_pll_topk_match_ood += count_topk_label_matches(topK_indices1, idx_ood, indices, gt_train_labels)
                             topK_conf = topK_probs.sum(dim=1)
 
                             estimated_labelsets1 = generate_label_sets(topK_indices1, cfg.n_classes)

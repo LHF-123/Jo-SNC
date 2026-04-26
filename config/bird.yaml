@@ -1,5 +1,5 @@
 # dataset
-data_root: ../datasets/
+data_root: /root/autodl-tmp/
 dataset: web-bird
 n_classes: 200
 rescale_size: 448
@@ -8,12 +8,12 @@ crop_size: 448
 # network & optimization
 arch: resnet50
 opt: sgd
-batch_size: 64
+batch_size: 56
 epochs: 120
-lr: 0.01
+lr: 0.00875
 lr_decay: cosine:10
 warmup_epochs: 5
-warmup_lr: 0.01
+warmup_lr: 0.00875
 warmup_lr_plan: constant
 weight_decay: 1.0e-5
 use_fp16: True
