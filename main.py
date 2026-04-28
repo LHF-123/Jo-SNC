@@ -34,7 +34,15 @@ from utils.builder import build_transform, get_dataset_normalization, build_cifa
 from utils.eval import accuracy, evaluate, detection_evaluate
 from utils.utils import *
 from utils.loss import *
-from utils.local_evidence import LOCAL_EVIDENCE_CSV_HEADER, compute_local_evidence, format_local_evidence_row
+from utils.local_evidence import (
+    LOCAL_EVIDENCE_CSV_HEADER,
+    PART_CE_CSV_HEADER,
+    build_local_part_batch,
+    build_part_ce_log_row,
+    compute_local_evidence,
+    format_local_evidence_row,
+    format_part_ce_row,
+)
 
 from PIL import ImageFile
 
@@ -60,6 +68,11 @@ def save_network_arch(log_dir, net):
 
 def wrapup_training_statics(result_dir, best_accuracy):
     stats = get_stats(f'{result_dir}/log.txt')
+    if len(stats['valid_epoch']) == 0:
+        # 短跑或诊断任务可能没有可统计的 epoch 汇总行，此时保留原目录即可。
+        with open(f'{result_dir}/stats.txt', 'w') as f:
+            f.write('No valid epoch records found; skip mean/std statistics.\n')
+        return
     with open(f'{result_dir}/stats.txt', 'w') as f:
         f.write(f"valid epochs: {stats['valid_epoch']}\n")
         if 'mean' in stats.keys():
@@ -312,6 +325,12 @@ def main(gpu, cfg):
     threshold_writer = Writer(root_dir=result_dir, filename='threshold.csv', header='epoch,threshold_clean,threshold_ood')
     pr_metric_writer = Writer(root_dir=result_dir, filename='prfa_metric.csv', header='epoch,N,P,R,F1,AUROC,N,P,R,F1,AUROC,N,P,R,F1,AUROC')
     pll_topk_acc_writer = Writer(root_dir=result_dir, filename='pll_topk_acc.csv', header='epoch,top1AccID,topkAccID,top1AccOOD,topkAccOOD')
+    if cfg.part_ce and cfg.part_ce_groups != 'clean':
+        raise ValueError('B1 currently supports part_ce_groups=clean only.')
+    part_ce_writer = None
+    if cfg.part_ce and cfg.part_ce_log:
+        # B1 单独写局部 CE 诊断日志；不依赖 A1 local_evidence 开关。
+        part_ce_writer = Writer(root_dir=result_dir, filename='part_ce.csv', header=PART_CE_CSV_HEADER)
     local_evidence_writer = None
     local_evidence_image_dir = None
     local_evidence_norm = None
@@ -530,6 +549,48 @@ def main(gpu, cfg):
                     # final loss
                     loss = loss_cls + cfg.alpha * loss_con_pred + cfg.gamma * loss_con_feat + cfg.beta * loss_ncr
 
+                    if cfg.part_ce:
+                        part_ce_group = 'clean'
+                        part_ce_loss = loss.new_tensor(0.0)
+                        part_ce_batch = {'num_selected': int(idx_clean.numel()), 'num_valid': 0}
+                        logits_part = logits1[:0]
+                        logits_erase = logits1[:0]
+                        logits_ori = logits1[:0]
+                        if idx_clean.numel() > 0:
+                            cam_model = k_model if cfg.part_ce_use_teacher_cam else q_model
+                            part_ce_batch = build_local_part_batch(
+                                cam_model, x1, y, idx_clean,
+                                cam_quantile=cfg.local_evidence_cam_quantile,
+                                min_area=cfg.local_evidence_min_area,
+                                max_area=cfg.local_evidence_max_area,
+                                bbox_padding=cfg.local_evidence_bbox_padding,
+                                cam_type=cfg.local_evidence_cam_type,
+                            )
+                            if part_ce_batch['num_valid'] > 0 and part_ce_batch['x_part'].numel() > 0:
+                                # B1 只用 CAM/bbox 定位局部区域；bbox 是离散裁剪依据，不参与反传。
+                                # x_part 作为局部图输入 student，part CE loss 只反传更新 q_model。
+                                student_was_training = q_model.training
+                                q_model.train()
+                                logits_part = q_model(part_ce_batch['x_part'])[0]
+                                part_ce_loss = F.cross_entropy(logits_part, part_ce_batch['labels'])
+                                q_model.eval()
+                                try:
+                                    with torch.no_grad():
+                                        logits_erase = q_model(part_ce_batch['x_erase'])[0]
+                                finally:
+                                    if student_was_training:
+                                        q_model.train()
+                                    else:
+                                        q_model.eval()
+                                logits_ori = logits1[part_ce_batch['batch_indices']]
+                                loss = loss + cfg.part_ce_weight * part_ce_loss
+                        if part_ce_writer is not None:
+                            part_ce_row = build_part_ce_log_row(
+                                epoch + 1, it, part_ce_group, part_ce_batch,
+                                part_ce_loss, logits_ori, logits_part, logits_erase
+                            )
+                            part_ce_writer.write(format_part_ce_row(part_ce_row))
+
                     l1 = losses_cls_clean.mean().clone().detach().item() if idx_clean.size(0) > 0 else 0.000
                     l2 = losses_cls_id.mean().clone().detach().item() if idx_id.size(0) > 0 else 0.000
                     l3 = losses_cls_ood.mean().clone().detach().item() if idx_ood.size(0) > 0 else 0.000
@@ -717,7 +778,8 @@ def check_args(args):
         'local_evidence_cam_quantile', 'local_evidence_use_teacher',
         'local_evidence_min_area', 'local_evidence_max_area',
         'local_evidence_bbox_padding', 'local_evidence_cam_type',
-        'local_evidence_save_images', 'local_evidence_image_max_samples'
+        'local_evidence_save_images', 'local_evidence_image_max_samples',
+        'part_ce', 'part_ce_weight', 'part_ce_groups', 'part_ce_use_teacher_cam', 'part_ce_log'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -789,17 +851,40 @@ def parse_args():
     parser.add_argument('--conf-weight', action='store_true')
     parser.add_argument('--predefined-tau-clean', action='store_true')
     # A1 局部证据诊断参数：默认只写 CSV，不额外加入 loss。
-    parser.add_argument('--local-evidence', action='store_true', default=None)
-    parser.add_argument('--local-evidence-every', type=int, default=None)
-    parser.add_argument('--local-evidence-max-batches', type=int, default=None)
-    parser.add_argument('--local-evidence-cam-quantile', type=float, default=None)
-    parser.add_argument('--local-evidence-use-teacher', action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument('--local-evidence-min-area', type=float, default=None)
-    parser.add_argument('--local-evidence-max-area', type=float, default=None)
-    parser.add_argument('--local-evidence-bbox-padding', type=float, default=None)
-    parser.add_argument('--local-evidence-cam-type', type=str, default=None)
-    parser.add_argument('--local-evidence-save-images', action='store_true', default=None)
-    parser.add_argument('--local-evidence-image-max-samples', type=int, default=None)
+    parser.add_argument('--local-evidence', action='store_true', default=None,
+                        help='开启 A1 局部证据诊断；只写 CSV/可选图片，不加入额外 loss。')
+    parser.add_argument('--local-evidence-every', type=int, default=None,
+                        help='A1 每隔多少个 epoch 运行一次；1 表示每轮都运行。')
+    parser.add_argument('--local-evidence-max-batches', type=int, default=None,
+                        help='每个诊断 epoch 最多处理多少个 batch；0 表示不限制。')
+    parser.add_argument('--local-evidence-cam-quantile', type=float, default=None,
+                        help='CAM 高响应阈值分位数；0.8 表示取响应最高约 20% 的区域。')
+    parser.add_argument('--local-evidence-use-teacher', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否使用 EMA teacher 生成 CAM 和局部证据；可用 --no-local-evidence-use-teacher 关闭。')
+    parser.add_argument('--local-evidence-min-area', type=float, default=None,
+                        help='CAM bbox 最小面积占原图比例，防止局部图过小。')
+    parser.add_argument('--local-evidence-max-area', type=float, default=None,
+                        help='CAM bbox 最大面积占原图比例，防止局部图接近整图。')
+    parser.add_argument('--local-evidence-bbox-padding', type=float, default=None,
+                        help='CAM bbox 周围扩展比例，用于保留一点上下文。')
+    parser.add_argument('--local-evidence-cam-type', type=str, default=None,
+                        help='CAM 类型；当前只支持 weightcam。')
+    parser.add_argument('--local-evidence-save-images', action='store_true', default=None,
+                        help='保存 A1 可视化 PNG：原图+bbox、CAM 叠加、局部图、擦除图。')
+    parser.add_argument('--local-evidence-image-max-samples', type=int, default=None,
+                        help='每个触发 batch 最多保存多少张 A1 可视化图片。')
+
+    # B1 直接局部 CE：默认关闭，只在 Jo-SNC stage 对指定分组的 x_part 加 CE。
+    parser.add_argument('--part-ce', action='store_true', default=None,
+                        help='开启 B1 直接局部 CE 消融。')
+    parser.add_argument('--part-ce-weight', type=float, default=None,
+                        help='B1 局部 CE 加到总 loss 的权重。')
+    parser.add_argument('--part-ce-groups', type=str, default=None,
+                        help='B1 使用哪些 Jo-SNC 分组；当前第一版只支持 clean。')
+    parser.add_argument('--part-ce-use-teacher-cam', action=argparse.BooleanOptionalAction, default=None,
+                        help='B1 是否使用 EMA teacher 生成 CAM/bbox；CE 始终反传到 student。')
+    parser.add_argument('--part-ce-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 B1 part_ce.csv 诊断日志。')
 
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
@@ -822,6 +907,12 @@ def parse_args():
     args.setdefault('local_evidence_cam_type', 'weightcam')
     args.setdefault('local_evidence_save_images', False)
     args.setdefault('local_evidence_image_max_samples', 8)
+    # B1 默认关闭；开启后无需同时开启 A1 local_evidence，也会独立写 part_ce.csv。
+    args.setdefault('part_ce', False)
+    args.setdefault('part_ce_weight', 0.1)
+    args.setdefault('part_ce_groups', 'clean')
+    args.setdefault('part_ce_use_teacher_cam', True)
+    args.setdefault('part_ce_log', True)
     assert check_args(args)
     return gpu, edict(args)
 

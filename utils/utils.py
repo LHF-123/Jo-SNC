@@ -258,22 +258,32 @@ def get_stats(result_file):
     test_acc_list = []
     test_acc_list2 = []
     valid_epoch = []
-    # valid_epoch = [191, 192, 193, 194, 195, 196, 197, 198, 199, 200]
-    for idx in range(1, 11):
-        line = lines[-idx].strip()
-        if 'test loss' in line:
-            epoch, train_loss, train_acc, test_loss, test_acc = line.split(' | ')[:5]
-        else:
-            epoch, train_loss, train_acc, test_acc = line.split(' | ')[:4]
-        ep = int(epoch.split(': ')[1])
-        valid_epoch.append(ep)
-        # assert ep in valid_epoch, ep
-        if '/' not in test_acc:
-            test_acc_list.append(float(test_acc.split(': ')[1]))
-        else:
-            test_acc1, test_acc2 = map(lambda x: float(x), test_acc.split(': ')[1].lstrip('(').rstrip(')').split('/'))
-            test_acc_list.append(test_acc1)
-            test_acc_list2.append(test_acc2)
+    # 收尾统计只需要最近最多 10 条有效 epoch 记录；短跑/A1 诊断可能不足 10 条。
+    for line in reversed(lines):
+        if len(valid_epoch) >= 10:
+            break
+        line = line.strip()
+        try:
+            if 'test loss' in line:
+                epoch, train_loss, train_acc, test_loss, test_acc = line.split(' | ')[:5]
+            else:
+                epoch, train_loss, train_acc, test_acc = line.split(' | ')[:4]
+            ep = int(epoch.split(': ')[1])
+            if '/' not in test_acc:
+                test_acc_list.append(float(test_acc.split(': ')[1]))
+            else:
+                test_acc1, test_acc2 = map(lambda x: float(x), test_acc.split(': ')[1].lstrip('(').rstrip(')').split('/'))
+                test_acc_list.append(test_acc1)
+                test_acc_list2.append(test_acc2)
+            valid_epoch.append(ep)
+        except (IndexError, ValueError):
+            # 跳过非 epoch 汇总行，避免日志格式变化或空行导致短跑收尾崩溃。
+            continue
+    valid_epoch.reverse()
+    test_acc_list.reverse()
+    test_acc_list2.reverse()
+    if len(test_acc_list) == 0:
+        return {'valid_epoch': []}
     if len(test_acc_list2) == 0:
         test_acc_list = np.array(test_acc_list)
         print(valid_epoch)

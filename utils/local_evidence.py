@@ -19,6 +19,12 @@ LOCAL_EVIDENCE_CSV_HEADER = (
     'bbox_area,bbox_x1,bbox_y1,bbox_x2,bbox_y2,cam_quantile,cam_type,erase_fill'
 )
 
+PART_CE_CSV_HEADER = (
+    'epoch,batch_idx,group,num_selected,num_valid,valid_part_ratio,'
+    'part_ce_loss,p_ori_y_mean,p_part_y_mean,p_erase_y_mean,'
+    'erase_drop_mean,evidence_score_mean,bbox_area_mean'
+)
+
 
 def format_local_evidence_row(row):
     return (
@@ -30,6 +36,17 @@ def format_local_evidence_row(row):
         f"{row['bbox_area']:.6f},{row['bbox_x1']},{row['bbox_y1']},"
         f"{row['bbox_x2']},{row['bbox_y2']},{row['cam_quantile']:.4f},"
         f"{row['cam_type']},{row['erase_fill']}"
+    )
+
+
+def format_part_ce_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['group']},"
+        f"{row['num_selected']},{row['num_valid']},{row['valid_part_ratio']:.6f},"
+        f"{row['part_ce_loss']:.6f},{row['p_ori_y_mean']:.6f},"
+        f"{row['p_part_y_mean']:.6f},{row['p_erase_y_mean']:.6f},"
+        f"{row['erase_drop_mean']:.6f},{row['evidence_score_mean']:.6f},"
+        f"{row['bbox_area_mean']:.6f}"
     )
 
 
@@ -79,6 +96,101 @@ def erase_by_mask(images, masks, fill_value=0.0):
     erased = images.clone()
     erased = erased.masked_fill(masks[:, None, :, :].bool(), fill_value)
     return erased
+
+
+def build_local_part_batch(
+        model,
+        images,
+        labels,
+        selected_indices,
+        cam_quantile=0.8,
+        min_area=0.05,
+        max_area=0.7,
+        bbox_padding=0.05,
+        cam_type='weightcam'):
+    selected_indices = selected_indices.detach().long()
+    num_selected = int(selected_indices.numel())
+
+    # B1 只用 CAM/bbox 定位局部区域；bbox 是离散裁剪依据，不参与反传。
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad(), _autocast_disabled(images):
+            cam, _ = generate_cam(model, images.float(), labels, cam_type=cam_type)
+            bboxes, bbox_areas, erase_masks = cam_to_bbox(
+                cam, images.shape[-2:], quantile=cam_quantile,
+                min_area=min_area, max_area=max_area, padding=bbox_padding
+            )
+            x_part = crop_by_bbox(images.float(), bboxes)
+            x_erase = erase_by_mask(images.float(), erase_masks, fill_value=0.0)
+    finally:
+        if was_training:
+            model.train()
+
+    bbox_areas = torch.tensor(bbox_areas, device=images.device, dtype=images.dtype)
+    selected_bbox_areas = bbox_areas[selected_indices] if num_selected > 0 else bbox_areas[:0]
+    valid_mask = torch.isfinite(selected_bbox_areas) & (selected_bbox_areas > 0)
+    valid_indices = selected_indices[valid_mask]
+
+    return {
+        'x_part': x_part[valid_indices],
+        'x_erase': x_erase[valid_indices],
+        'labels': labels[valid_indices],
+        'batch_indices': valid_indices,
+        'bbox_area': bbox_areas[valid_indices],
+        'num_selected': num_selected,
+        'num_valid': int(valid_indices.numel()),
+    }
+
+
+def build_part_ce_log_row(epoch, batch_idx, group, part_batch, part_ce_loss,
+                          logits_ori, logits_part, logits_erase):
+    num_selected = part_batch['num_selected']
+    num_valid = part_batch['num_valid']
+    if num_selected == 0 or num_valid == 0:
+        return _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid, part_ce_loss)
+
+    # B1 记录原图、局部图和擦除图对 noisy label 的响应，方便后续和 evidence gate 对比。
+    labels = part_batch['labels'].long()
+    p_ori_y = logits_ori.detach().softmax(dim=1).gather(1, labels[:, None]).squeeze(1)
+    p_part_y = logits_part.detach().softmax(dim=1).gather(1, labels[:, None]).squeeze(1)
+    p_erase_y = logits_erase.detach().softmax(dim=1).gather(1, labels[:, None]).squeeze(1)
+    erase_drop = p_ori_y - p_erase_y
+    evidence_score = p_ori_y * p_part_y * erase_drop.clamp(min=0)
+
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'num_selected': int(num_selected),
+        'num_valid': int(num_valid),
+        'valid_part_ratio': float(num_valid / max(num_selected, 1)),
+        'part_ce_loss': float(part_ce_loss.detach().item()),
+        'p_ori_y_mean': float(p_ori_y.mean().item()),
+        'p_part_y_mean': float(p_part_y.mean().item()),
+        'p_erase_y_mean': float(p_erase_y.mean().item()),
+        'erase_drop_mean': float(erase_drop.mean().item()),
+        'evidence_score_mean': float(evidence_score.mean().item()),
+        'bbox_area_mean': float(part_batch['bbox_area'].detach().mean().item()),
+    }
+
+
+def _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid, part_ce_loss):
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'num_selected': int(num_selected),
+        'num_valid': int(num_valid),
+        'valid_part_ratio': 0.0,
+        'part_ce_loss': float(part_ce_loss.detach().item()),
+        'p_ori_y_mean': 0.0,
+        'p_part_y_mean': 0.0,
+        'p_erase_y_mean': 0.0,
+        'erase_drop_mean': 0.0,
+        'evidence_score_mean': 0.0,
+        'bbox_area_mean': 0.0,
+    }
 
 
 def save_local_evidence_images(output_dir, rows, images, cam, x_part, x_erase, norm_mean, norm_std, max_samples=8):

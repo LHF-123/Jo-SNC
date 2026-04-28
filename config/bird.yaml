@@ -23,12 +23,32 @@ eps: 0.3
 alpha: 0.3
 beta: 0.8
 gamma: 0.001
-fdim: 512
+fdim: 256
 queue_length: 32000
 n_neighbors: 10
 topK: 10
 tau_m: 0.98
 # Warmup omega_tau is fixed to 0.75 in main.py.
+
+# A1
+local_evidence: false
+local_evidence_every: 5
+local_evidence_max_batches: 20
+local_evidence_cam_quantile: 0.85
+local_evidence_use_teacher: true
+local_evidence_min_area: 0.05
+local_evidence_max_area: 0.45
+local_evidence_bbox_padding: 0.02
+local_evidence_cam_type: weightcam
+local_evidence_save_images: false
+local_evidence_image_max_samples: 8
+
+# B1
+part_ce: true
+part_ce_weight: 0.1
+part_ce_groups: clean
+part_ce_use_teacher_cam: true
+part_ce_log: true
 
 # logging
 log_root: ./results/
