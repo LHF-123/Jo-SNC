@@ -21,8 +21,9 @@ LOCAL_EVIDENCE_CSV_HEADER = (
 
 PART_CE_CSV_HEADER = (
     'epoch,batch_idx,group,num_selected,num_valid,valid_part_ratio,'
-    'part_ce_loss,p_ori_y_mean,p_part_y_mean,p_erase_y_mean,'
-    'erase_drop_mean,evidence_score_mean,bbox_area_mean'
+    'josnc_loss,part_ce_loss,part_ce_weight,weighted_part_ce_loss,loss_ratio,'
+    'p_ori_y_mean,p_part_y_mean,p_erase_y_mean,erase_drop_mean,'
+    'evidence_score_mean,bbox_area_mean'
 )
 
 
@@ -43,7 +44,9 @@ def format_part_ce_row(row):
     return (
         f"{row['epoch']},{row['batch_idx']},{row['group']},"
         f"{row['num_selected']},{row['num_valid']},{row['valid_part_ratio']:.6f},"
-        f"{row['part_ce_loss']:.6f},{row['p_ori_y_mean']:.6f},"
+        f"{row['josnc_loss']:.6f},{row['part_ce_loss']:.6f},"
+        f"{row['part_ce_weight']:.6f},{row['weighted_part_ce_loss']:.6f},"
+        f"{row['loss_ratio']:.6f},{row['p_ori_y_mean']:.6f},"
         f"{row['p_part_y_mean']:.6f},{row['p_erase_y_mean']:.6f},"
         f"{row['erase_drop_mean']:.6f},{row['evidence_score_mean']:.6f},"
         f"{row['bbox_area_mean']:.6f}"
@@ -143,12 +146,20 @@ def build_local_part_batch(
     }
 
 
-def build_part_ce_log_row(epoch, batch_idx, group, part_batch, part_ce_loss,
+def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
+                          part_ce_loss, part_ce_weight,
                           logits_ori, logits_part, logits_erase):
     num_selected = part_batch['num_selected']
     num_valid = part_batch['num_valid']
+    josnc_loss_value, part_ce_loss_value, weighted_part_ce_loss, loss_ratio = _part_ce_loss_values(
+        josnc_loss, part_ce_loss, part_ce_weight
+    )
     if num_selected == 0 or num_valid == 0:
-        return _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid, part_ce_loss)
+        return _empty_part_ce_log_row(
+            epoch, batch_idx, group, num_selected, num_valid,
+            josnc_loss_value, part_ce_loss_value, part_ce_weight,
+            weighted_part_ce_loss, loss_ratio
+        )
 
     # B1 记录原图、局部图和擦除图对 noisy label 的响应，方便后续和 evidence gate 对比。
     labels = part_batch['labels'].long()
@@ -165,7 +176,11 @@ def build_part_ce_log_row(epoch, batch_idx, group, part_batch, part_ce_loss,
         'num_selected': int(num_selected),
         'num_valid': int(num_valid),
         'valid_part_ratio': float(num_valid / max(num_selected, 1)),
-        'part_ce_loss': float(part_ce_loss.detach().item()),
+        'josnc_loss': josnc_loss_value,
+        'part_ce_loss': part_ce_loss_value,
+        'part_ce_weight': float(part_ce_weight),
+        'weighted_part_ce_loss': weighted_part_ce_loss,
+        'loss_ratio': loss_ratio,
         'p_ori_y_mean': float(p_ori_y.mean().item()),
         'p_part_y_mean': float(p_part_y.mean().item()),
         'p_erase_y_mean': float(p_erase_y.mean().item()),
@@ -175,7 +190,18 @@ def build_part_ce_log_row(epoch, batch_idx, group, part_batch, part_ce_loss,
     }
 
 
-def _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid, part_ce_loss):
+def _part_ce_loss_values(josnc_loss, part_ce_loss, part_ce_weight):
+    josnc_loss_value = float(josnc_loss.detach().item())
+    part_ce_loss_value = float(part_ce_loss.detach().item())
+    weighted_part_ce_loss = float(part_ce_weight) * part_ce_loss_value
+    # B1 记录加权局部 CE 相对主 Jo-SNC loss 的比例，用来判断分支实际强度。
+    loss_ratio = weighted_part_ce_loss / max(abs(josnc_loss_value), 1e-12)
+    return josnc_loss_value, part_ce_loss_value, weighted_part_ce_loss, loss_ratio
+
+
+def _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid,
+                           josnc_loss, part_ce_loss, part_ce_weight,
+                           weighted_part_ce_loss, loss_ratio):
     return {
         'epoch': int(epoch),
         'batch_idx': int(batch_idx),
@@ -183,7 +209,11 @@ def _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid, par
         'num_selected': int(num_selected),
         'num_valid': int(num_valid),
         'valid_part_ratio': 0.0,
-        'part_ce_loss': float(part_ce_loss.detach().item()),
+        'josnc_loss': float(josnc_loss),
+        'part_ce_loss': float(part_ce_loss),
+        'part_ce_weight': float(part_ce_weight),
+        'weighted_part_ce_loss': float(weighted_part_ce_loss),
+        'loss_ratio': float(loss_ratio),
         'p_ori_y_mean': 0.0,
         'p_part_y_mean': 0.0,
         'p_erase_y_mean': 0.0,

@@ -548,6 +548,7 @@ def main(gpu, cfg):
 
                     # final loss
                     loss = loss_cls + cfg.alpha * loss_con_pred + cfg.gamma * loss_con_feat + cfg.beta * loss_ncr
+                    josnc_loss = loss
 
                     if cfg.part_ce:
                         part_ce_group = 'clean'
@@ -587,7 +588,8 @@ def main(gpu, cfg):
                         if part_ce_writer is not None:
                             part_ce_row = build_part_ce_log_row(
                                 epoch + 1, it, part_ce_group, part_ce_batch,
-                                part_ce_loss, logits_ori, logits_part, logits_erase
+                                josnc_loss, part_ce_loss, cfg.part_ce_weight,
+                                logits_ori, logits_part, logits_erase
                             )
                             part_ce_writer.write(format_part_ce_row(part_ce_row))
 
