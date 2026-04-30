@@ -23,7 +23,14 @@ PART_CE_CSV_HEADER = (
     'epoch,batch_idx,group,num_selected,num_valid,valid_part_ratio,'
     'josnc_loss,part_ce_loss,part_ce_weight,weighted_part_ce_loss,loss_ratio,'
     'p_ori_y_mean,p_part_y_mean,p_erase_y_mean,erase_drop_mean,'
-    'evidence_score_mean,bbox_area_mean'
+    'evidence_score_mean,bbox_area_mean,num_gated,gate_ratio,'
+    'gate_threshold,gated_evidence_score_mean,filtered_evidence_score_mean,'
+    'gated_erase_drop_mean,filtered_erase_drop_mean'
+)
+
+PART_CE_GATE_SAMPLE_CSV_HEADER = (
+    'epoch,batch_idx,sample_id,noisy_label,group,evidence_score,gate,'
+    'p_ori_y,p_part_y,p_erase_y,erase_drop,bbox_area,pred_top1,pred_conf'
 )
 
 
@@ -49,7 +56,22 @@ def format_part_ce_row(row):
         f"{row['loss_ratio']:.6f},{row['p_ori_y_mean']:.6f},"
         f"{row['p_part_y_mean']:.6f},{row['p_erase_y_mean']:.6f},"
         f"{row['erase_drop_mean']:.6f},{row['evidence_score_mean']:.6f},"
-        f"{row['bbox_area_mean']:.6f}"
+        f"{row['bbox_area_mean']:.6f},{row['num_gated']},"
+        f"{row['gate_ratio']:.6f},{row['gate_threshold']:.6f},"
+        f"{row['gated_evidence_score_mean']:.6f},"
+        f"{row['filtered_evidence_score_mean']:.6f},"
+        f"{row['gated_erase_drop_mean']:.6f},"
+        f"{row['filtered_erase_drop_mean']:.6f}"
+    )
+
+
+def format_part_ce_gate_sample_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['sample_id']},"
+        f"{row['noisy_label']},{row['group']},{row['evidence_score']:.6f},"
+        f"{row['gate']},{row['p_ori_y']:.6f},{row['p_part_y']:.6f},"
+        f"{row['p_erase_y']:.6f},{row['erase_drop']:.6f},"
+        f"{row['bbox_area']:.6f},{row['pred_top1']},{row['pred_conf']:.6f}"
     )
 
 
@@ -101,6 +123,50 @@ def erase_by_mask(images, masks, fill_value=0.0):
     return erased
 
 
+def compute_evidence_values(logits_ori, logits_part, logits_erase, labels):
+    # C1 统一计算 teacher/no-grad 局部证据，保证门控分数和日志字段使用同一套定义。
+    label_indices = labels.long()
+    p_ori_y = logits_ori.detach().softmax(dim=1).gather(1, label_indices[:, None]).squeeze(1)
+    p_part_y = logits_part.detach().softmax(dim=1).gather(1, label_indices[:, None]).squeeze(1)
+    p_erase_y = logits_erase.detach().softmax(dim=1).gather(1, label_indices[:, None]).squeeze(1)
+    erase_drop = p_ori_y - p_erase_y
+    evidence_score = p_ori_y * p_part_y * erase_drop.clamp(min=0)
+    return {
+        'p_ori_y': p_ori_y,
+        'p_part_y': p_part_y,
+        'p_erase_y': p_erase_y,
+        'erase_drop': erase_drop,
+        'evidence_score': evidence_score,
+    }
+
+
+def build_gate_mask(evidence_score, gate_type='percentile', threshold=0.10, keep_ratio=0.50):
+    # C1 支持固定阈值和 batch 内分位门控；返回实际使用的阈值便于写日志。
+    evidence_score = evidence_score.detach()
+    gate_type = str(gate_type).lower()
+    if evidence_score.numel() == 0:
+        return evidence_score.new_zeros((0,), dtype=torch.bool), evidence_score.new_tensor(0.0)
+
+    if gate_type == 'fixed':
+        gate_threshold = evidence_score.new_tensor(float(threshold))
+        return evidence_score > gate_threshold, gate_threshold
+
+    if gate_type == 'percentile':
+        keep_ratio = max(0.0, min(float(keep_ratio), 1.0))
+        if keep_ratio <= 0:
+            return torch.zeros_like(evidence_score, dtype=torch.bool), evidence_score.new_tensor(0.0)
+        k = max(1, int(evidence_score.numel() * keep_ratio))
+        k = min(k, evidence_score.numel())
+        topk_values, topk_indices = torch.topk(evidence_score, k, largest=True, sorted=False)
+        gate_mask = torch.zeros_like(evidence_score, dtype=torch.bool)
+        # percentile 按 top-k 索引严格保留 k 个样本，避免 evidence 并列时超额放行。
+        gate_mask[topk_indices] = True
+        gate_threshold = topk_values.min()
+        return gate_mask, gate_threshold
+
+    raise ValueError(f'part_ce_gate_type should be fixed or percentile, got {gate_type}.')
+
+
 def build_local_part_batch(
         model,
         images,
@@ -119,13 +185,16 @@ def build_local_part_batch(
     model.eval()
     try:
         with torch.no_grad(), _autocast_disabled(images):
-            cam, _ = generate_cam(model, images.float(), labels, cam_type=cam_type)
+            cam, logits_ori = generate_cam(model, images.float(), labels, cam_type=cam_type)
             bboxes, bbox_areas, erase_masks = cam_to_bbox(
                 cam, images.shape[-2:], quantile=cam_quantile,
                 min_area=min_area, max_area=max_area, padding=bbox_padding
             )
             x_part = crop_by_bbox(images.float(), bboxes)
             x_erase = erase_by_mask(images.float(), erase_masks, fill_value=0.0)
+            logits_part = _extract_logits(model(x_part))
+            logits_erase = _extract_logits(model(x_erase))
+            evidence_values = compute_evidence_values(logits_ori, logits_part, logits_erase, labels)
     finally:
         if was_training:
             model.train()
@@ -139,16 +208,22 @@ def build_local_part_batch(
         'x_part': x_part[valid_indices],
         'x_erase': x_erase[valid_indices],
         'labels': labels[valid_indices],
+        'selected_indices': selected_indices,
+        'valid_mask': valid_mask,
         'batch_indices': valid_indices,
         'bbox_area': bbox_areas[valid_indices],
+        'p_ori_y': evidence_values['p_ori_y'][valid_indices],
+        'p_part_y': evidence_values['p_part_y'][valid_indices],
+        'p_erase_y': evidence_values['p_erase_y'][valid_indices],
+        'erase_drop': evidence_values['erase_drop'][valid_indices],
+        'evidence_score': evidence_values['evidence_score'][valid_indices],
         'num_selected': num_selected,
         'num_valid': int(valid_indices.numel()),
     }
 
 
 def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
-                          part_ce_loss, part_ce_weight,
-                          logits_ori, logits_part, logits_erase):
+                          part_ce_loss, part_ce_weight):
     num_selected = part_batch['num_selected']
     num_valid = part_batch['num_valid']
     josnc_loss_value, part_ce_loss_value, weighted_part_ce_loss, loss_ratio = _part_ce_loss_values(
@@ -161,13 +236,20 @@ def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
             weighted_part_ce_loss, loss_ratio
         )
 
-    # B1 记录原图、局部图和擦除图对 noisy label 的响应，方便后续和 evidence gate 对比。
-    labels = part_batch['labels'].long()
-    p_ori_y = logits_ori.detach().softmax(dim=1).gather(1, labels[:, None]).squeeze(1)
-    p_part_y = logits_part.detach().softmax(dim=1).gather(1, labels[:, None]).squeeze(1)
-    p_erase_y = logits_erase.detach().softmax(dim=1).gather(1, labels[:, None]).squeeze(1)
-    erase_drop = p_ori_y - p_erase_y
-    evidence_score = p_ori_y * p_part_y * erase_drop.clamp(min=0)
+    # B1/C1 日志使用 build_local_part_batch 中的局部证据，C1 时与实际门控完全一致。
+    p_ori_y = part_batch['p_ori_y'].detach()
+    p_part_y = part_batch['p_part_y'].detach()
+    p_erase_y = part_batch['p_erase_y'].detach()
+    erase_drop = part_batch['erase_drop'].detach()
+    evidence_score = part_batch['evidence_score'].detach()
+    gate_mask = part_batch.get('gate_mask')
+    if gate_mask is None:
+        gate_mask = torch.ones(num_valid, device=evidence_score.device, dtype=torch.bool)
+    else:
+        gate_mask = gate_mask.detach().to(device=evidence_score.device, dtype=torch.bool)
+    filtered_mask = gate_mask.logical_not()
+    num_gated = int(gate_mask.sum().item())
+    gate_threshold = _float_value(part_batch.get('gate_threshold', 0.0))
 
     return {
         'epoch': int(epoch),
@@ -187,7 +269,66 @@ def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
         'erase_drop_mean': float(erase_drop.mean().item()),
         'evidence_score_mean': float(evidence_score.mean().item()),
         'bbox_area_mean': float(part_batch['bbox_area'].detach().mean().item()),
+        'num_gated': num_gated,
+        'gate_ratio': float(num_gated / max(num_valid, 1)),
+        'gate_threshold': gate_threshold,
+        'gated_evidence_score_mean': _mean_or_zero(evidence_score[gate_mask]),
+        'filtered_evidence_score_mean': _mean_or_zero(evidence_score[filtered_mask]),
+        'gated_erase_drop_mean': _mean_or_zero(erase_drop[gate_mask]),
+        'filtered_erase_drop_mean': _mean_or_zero(erase_drop[filtered_mask]),
     }
+
+
+def build_part_ce_gate_sample_rows(epoch, batch_idx, group, part_batch, sample_indices,
+                                   student_logits=None):
+    if part_batch['num_valid'] == 0:
+        return []
+
+    # C1 逐样本日志记录实际 CE gate，便于追踪长期被过滤的样本和证据分布。
+    batch_positions = part_batch['batch_indices'].detach().cpu().long()
+    if torch.is_tensor(sample_indices):
+        sample_ids = sample_indices.detach().cpu().long()[batch_positions]
+    else:
+        sample_ids = torch.tensor(sample_indices, dtype=torch.long)[batch_positions]
+
+    labels = part_batch['labels'].detach().cpu().long()
+    p_ori_y = part_batch['p_ori_y'].detach().cpu()
+    p_part_y = part_batch['p_part_y'].detach().cpu()
+    p_erase_y = part_batch['p_erase_y'].detach().cpu()
+    erase_drop = part_batch['erase_drop'].detach().cpu()
+    evidence_score = part_batch['evidence_score'].detach().cpu()
+    bbox_area = part_batch['bbox_area'].detach().cpu()
+    gate_mask = part_batch.get('gate_mask')
+    if gate_mask is None:
+        gate_mask = torch.ones(part_batch['num_valid'], dtype=torch.bool)
+    else:
+        gate_mask = gate_mask.detach().cpu().bool()
+
+    pred_top1 = torch.full((part_batch['num_valid'],), -1, dtype=torch.long)
+    pred_conf = torch.zeros(part_batch['num_valid'], dtype=torch.float)
+    if student_logits is not None:
+        student_probs = student_logits.detach().softmax(dim=1).cpu()
+        pred_conf, pred_top1 = student_probs[batch_positions].max(dim=1)
+
+    rows = []
+    for i in range(part_batch['num_valid']):
+        rows.append({
+            'epoch': int(epoch),
+            'batch_idx': int(batch_idx),
+            'sample_id': int(sample_ids[i].item()),
+            'noisy_label': int(labels[i].item()),
+            'group': group,
+            'evidence_score': float(evidence_score[i].item()),
+            'gate': int(gate_mask[i].item()),
+            'p_ori_y': float(p_ori_y[i].item()),
+            'p_part_y': float(p_part_y[i].item()),
+            'p_erase_y': float(p_erase_y[i].item()),
+            'erase_drop': float(erase_drop[i].item()),
+            'bbox_area': float(bbox_area[i].item()),
+            'pred_top1': int(pred_top1[i].item()),
+            'pred_conf': float(pred_conf[i].item()),
+        })
+    return rows
 
 
 def _part_ce_loss_values(josnc_loss, part_ce_loss, part_ce_weight):
@@ -220,7 +361,26 @@ def _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid,
         'erase_drop_mean': 0.0,
         'evidence_score_mean': 0.0,
         'bbox_area_mean': 0.0,
+        'num_gated': 0,
+        'gate_ratio': 0.0,
+        'gate_threshold': 0.0,
+        'gated_evidence_score_mean': 0.0,
+        'filtered_evidence_score_mean': 0.0,
+        'gated_erase_drop_mean': 0.0,
+        'filtered_erase_drop_mean': 0.0,
     }
+
+
+def _mean_or_zero(values):
+    if values.numel() == 0:
+        return 0.0
+    return float(values.detach().mean().item())
+
+
+def _float_value(value):
+    if torch.is_tensor(value):
+        return float(value.detach().item())
+    return float(value)
 
 
 def save_local_evidence_images(output_dir, rows, images, cam, x_part, x_erase, norm_mean, norm_std, max_samples=8):

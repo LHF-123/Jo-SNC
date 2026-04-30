@@ -43,15 +43,21 @@ local_evidence_cam_type: weightcam
 local_evidence_save_images: false
 local_evidence_image_max_samples: 8
 
-# B1
+# B1/C1 shared
 part_ce: true
-part_ce_weight: 0.1
+part_ce_weight: 0.5
 part_ce_groups: clean
 part_ce_use_teacher_cam: true
 part_ce_log: true
+
+# C1 gate
+part_ce_gate: true
+part_ce_gate_type: percentile
+part_ce_gate_threshold: 0.10
+part_ce_gate_keep_ratio: 0.50
+part_ce_gate_start_epoch: 20
 
 # logging
 log_root: ./results/
 log_proj: ''
 log_name: IterJoSRC
-

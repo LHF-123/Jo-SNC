@@ -36,11 +36,15 @@ from utils.utils import *
 from utils.loss import *
 from utils.local_evidence import (
     LOCAL_EVIDENCE_CSV_HEADER,
+    PART_CE_GATE_SAMPLE_CSV_HEADER,
     PART_CE_CSV_HEADER,
+    build_gate_mask,
     build_local_part_batch,
+    build_part_ce_gate_sample_rows,
     build_part_ce_log_row,
     compute_local_evidence,
     format_local_evidence_row,
+    format_part_ce_gate_sample_row,
     format_part_ce_row,
 )
 
@@ -326,11 +330,21 @@ def main(gpu, cfg):
     pr_metric_writer = Writer(root_dir=result_dir, filename='prfa_metric.csv', header='epoch,N,P,R,F1,AUROC,N,P,R,F1,AUROC,N,P,R,F1,AUROC')
     pll_topk_acc_writer = Writer(root_dir=result_dir, filename='pll_topk_acc.csv', header='epoch,top1AccID,topkAccID,top1AccOOD,topkAccOOD')
     if cfg.part_ce and cfg.part_ce_groups != 'clean':
-        raise ValueError('B1 currently supports part_ce_groups=clean only.')
+        raise ValueError('B1/C1 currently supports part_ce_groups=clean only.')
+    if cfg.part_ce_gate_type not in ['fixed', 'percentile']:
+        raise ValueError(f'part_ce_gate_type should be fixed or percentile, got {cfg.part_ce_gate_type}.')
+    if not (0.0 <= cfg.part_ce_gate_keep_ratio <= 1.0):
+        raise ValueError(f'part_ce_gate_keep_ratio should be within [0, 1], got {cfg.part_ce_gate_keep_ratio}.')
     part_ce_writer = None
+    part_ce_gate_sample_writer = None
     if cfg.part_ce and cfg.part_ce_log:
-        # B1 单独写局部 CE 诊断日志；不依赖 A1 local_evidence 开关。
+        # B1/C1 单独写局部 CE 诊断日志；不依赖 A1 local_evidence 开关。
         part_ce_writer = Writer(root_dir=result_dir, filename='part_ce.csv', header=PART_CE_CSV_HEADER)
+        part_ce_gate_sample_writer = Writer(
+            root_dir=result_dir,
+            filename='part_ce_gate_samples.csv',
+            header=PART_CE_GATE_SAMPLE_CSV_HEADER,
+        )
     local_evidence_writer = None
     local_evidence_image_dir = None
     local_evidence_norm = None
@@ -554,9 +568,6 @@ def main(gpu, cfg):
                         part_ce_group = 'clean'
                         part_ce_loss = loss.new_tensor(0.0)
                         part_ce_batch = {'num_selected': int(idx_clean.numel()), 'num_valid': 0}
-                        logits_part = logits1[:0]
-                        logits_erase = logits1[:0]
-                        logits_ori = logits1[:0]
                         if idx_clean.numel() > 0:
                             cam_model = k_model if cfg.part_ce_use_teacher_cam else q_model
                             part_ce_batch = build_local_part_batch(
@@ -568,30 +579,62 @@ def main(gpu, cfg):
                                 cam_type=cfg.local_evidence_cam_type,
                             )
                             if part_ce_batch['num_valid'] > 0 and part_ce_batch['x_part'].numel() > 0:
-                                # B1 只用 CAM/bbox 定位局部区域；bbox 是离散裁剪依据，不参与反传。
-                                # x_part 作为局部图输入 student，part CE loss 只反传更新 q_model。
-                                student_was_training = q_model.training
-                                q_model.train()
-                                logits_part = q_model(part_ce_batch['x_part'])[0]
-                                part_ce_loss = F.cross_entropy(logits_part, part_ce_batch['labels'])
-                                q_model.eval()
-                                try:
-                                    with torch.no_grad():
-                                        logits_erase = q_model(part_ce_batch['x_erase'])[0]
-                                finally:
-                                    if student_was_training:
-                                        q_model.train()
+                                # B1/C1 共用局部图生成；C1 未到启动 epoch 时不退化成 B1。
+                                if cfg.part_ce_gate:
+                                    if (epoch + 1) >= cfg.part_ce_gate_start_epoch:
+                                        gate_mask, gate_threshold = build_gate_mask(
+                                            part_ce_batch['evidence_score'],
+                                            gate_type=cfg.part_ce_gate_type,
+                                            threshold=cfg.part_ce_gate_threshold,
+                                            keep_ratio=cfg.part_ce_gate_keep_ratio,
+                                        )
                                     else:
-                                        q_model.eval()
-                                logits_ori = logits1[part_ce_batch['batch_indices']]
-                                loss = loss + cfg.part_ce_weight * part_ce_loss
+                                        gate_mask = torch.zeros(
+                                            part_ce_batch['num_valid'],
+                                            device=x1.device,
+                                            dtype=torch.bool,
+                                        )
+                                        gate_threshold = part_ce_batch['evidence_score'].new_tensor(0.0)
+                                else:
+                                    gate_mask = torch.ones(
+                                        part_ce_batch['num_valid'],
+                                        device=x1.device,
+                                        dtype=torch.bool,
+                                    )
+                                    gate_threshold = part_ce_batch['evidence_score'].new_tensor(0.0)
+                                part_ce_batch['gate_mask'] = gate_mask
+                                part_ce_batch['gate_threshold'] = gate_threshold
+
+                                num_gated = int(gate_mask.sum().item())
+                                if num_gated > 1:
+                                    # 只有实际通过门控的局部图进入 student 前向和 CE 反传。
+                                    student_was_training = q_model.training
+                                    q_model.train()
+                                    try:
+                                        logits_part = q_model(part_ce_batch['x_part'][gate_mask])[0]
+                                        labels_part = part_ce_batch['labels'][gate_mask]
+                                        part_ce_loss = F.cross_entropy(logits_part, labels_part)
+                                    finally:
+                                        if not student_was_training:
+                                            q_model.eval()
+                                    loss = loss + cfg.part_ce_weight * part_ce_loss
+                                elif num_gated == 1:
+                                    # 单样本会触发 BatchNorm1d 训练模式约束，跳过并清空实际 CE gate。
+                                    part_ce_batch['gate_mask'] = torch.zeros_like(gate_mask)
                         if part_ce_writer is not None:
                             part_ce_row = build_part_ce_log_row(
                                 epoch + 1, it, part_ce_group, part_ce_batch,
-                                josnc_loss, part_ce_loss, cfg.part_ce_weight,
-                                logits_ori, logits_part, logits_erase
+                                josnc_loss, part_ce_loss, cfg.part_ce_weight
                             )
                             part_ce_writer.write(format_part_ce_row(part_ce_row))
+                        if part_ce_gate_sample_writer is not None and part_ce_batch['num_valid'] > 0:
+                            # C1 逐样本 gate 日志记录实际参与 CE 的 gate，用于后续分析长期过滤样本。
+                            gate_sample_rows = build_part_ce_gate_sample_rows(
+                                epoch + 1, it, part_ce_group, part_ce_batch, indices,
+                                student_logits=logits1,
+                            )
+                            for row in gate_sample_rows:
+                                part_ce_gate_sample_writer.write(format_part_ce_gate_sample_row(row))
 
                     l1 = losses_cls_clean.mean().clone().detach().item() if idx_clean.size(0) > 0 else 0.000
                     l2 = losses_cls_id.mean().clone().detach().item() if idx_id.size(0) > 0 else 0.000
@@ -781,7 +824,9 @@ def check_args(args):
         'local_evidence_min_area', 'local_evidence_max_area',
         'local_evidence_bbox_padding', 'local_evidence_cam_type',
         'local_evidence_save_images', 'local_evidence_image_max_samples',
-        'part_ce', 'part_ce_weight', 'part_ce_groups', 'part_ce_use_teacher_cam', 'part_ce_log'
+        'part_ce', 'part_ce_weight', 'part_ce_groups', 'part_ce_use_teacher_cam', 'part_ce_log',
+        'part_ce_gate', 'part_ce_gate_type', 'part_ce_gate_threshold',
+        'part_ce_gate_keep_ratio', 'part_ce_gate_start_epoch'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -876,17 +921,28 @@ def parse_args():
     parser.add_argument('--local-evidence-image-max-samples', type=int, default=None,
                         help='每个触发 batch 最多保存多少张 A1 可视化图片。')
 
-    # B1 直接局部 CE：默认关闭，只在 Jo-SNC stage 对指定分组的 x_part 加 CE。
+    # B1/C1 局部 CE：C1 在 B1 的 clean 局部 CE 前增加 evidence gate。
     parser.add_argument('--part-ce', action='store_true', default=None,
-                        help='开启 B1 直接局部 CE 消融。')
+                        help='开启 B1/C1 局部 CE 分支。')
     parser.add_argument('--part-ce-weight', type=float, default=None,
-                        help='B1 局部 CE 加到总 loss 的权重。')
+                        help='局部 CE 加到总 loss 的权重。')
     parser.add_argument('--part-ce-groups', type=str, default=None,
-                        help='B1 使用哪些 Jo-SNC 分组；当前第一版只支持 clean。')
+                        help='局部 CE 使用哪些 Jo-SNC 分组；当前第一版只支持 clean。')
     parser.add_argument('--part-ce-use-teacher-cam', action=argparse.BooleanOptionalAction, default=None,
-                        help='B1 是否使用 EMA teacher 生成 CAM/bbox；CE 始终反传到 student。')
+                        help='是否使用 EMA teacher 生成 CAM/bbox 和 evidence；CE 始终反传到 student。')
     parser.add_argument('--part-ce-log', action=argparse.BooleanOptionalAction, default=None,
-                        help='是否写出 B1 part_ce.csv 诊断日志。')
+                        help='是否写出 part_ce.csv 诊断日志。')
+
+    parser.add_argument('--part-ce-gate', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 C1 clean 局部证据门控；关闭时保持 B1 直接局部 CE。')
+    parser.add_argument('--part-ce-gate-type', type=str, default=None,
+                        help='C1 门控方式：fixed 或 percentile。')
+    parser.add_argument('--part-ce-gate-threshold', type=float, default=None,
+                        help='C1 fixed 门控阈值。')
+    parser.add_argument('--part-ce-gate-keep-ratio', type=float, default=None,
+                        help='C1 percentile 门控保留比例。')
+    parser.add_argument('--part-ce-gate-start-epoch', type=int, default=None,
+                        help='从第几个用户可见 epoch 开始启用 C1 门控局部 CE。')
 
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
@@ -909,12 +965,19 @@ def parse_args():
     args.setdefault('local_evidence_cam_type', 'weightcam')
     args.setdefault('local_evidence_save_images', False)
     args.setdefault('local_evidence_image_max_samples', 8)
-    # B1 默认关闭；开启后无需同时开启 A1 local_evidence，也会独立写 part_ce.csv。
+    # B1/C1 默认关闭；开启后无需同时开启 A1 local_evidence，也会独立写 part_ce.csv。
     args.setdefault('part_ce', False)
-    args.setdefault('part_ce_weight', 0.1)
+    args.setdefault('part_ce_weight', 0.5)
     args.setdefault('part_ce_groups', 'clean')
     args.setdefault('part_ce_use_teacher_cam', True)
     args.setdefault('part_ce_log', True)
+    args.setdefault('part_ce_gate', False)
+    args.setdefault('part_ce_gate_type', 'percentile')
+    args.setdefault('part_ce_gate_threshold', 0.10)
+    args.setdefault('part_ce_gate_keep_ratio', 0.50)
+    args.setdefault('part_ce_gate_start_epoch', 20)
+    # C1 门控类型统一小写，避免 YAML/命令行大小写差异导致误判。
+    args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
     assert check_args(args)
     return gpu, edict(args)
 
