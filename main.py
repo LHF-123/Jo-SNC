@@ -349,6 +349,12 @@ def main(gpu, cfg):
         raise ValueError(f'id_candidate_cam_target should be teacher_top1, got {cfg.id_candidate_cam_target}.')
     if cfg.id_candidate_score_type not in ['ori_part_minus_erase']:
         raise ValueError(f'id_candidate_score_type should be ori_part_minus_erase, got {cfg.id_candidate_score_type}.')
+    if cfg.id_candidate_entropy_weight < 0.0:
+        raise ValueError(f'id_candidate_entropy_weight should be non-negative, got {cfg.id_candidate_entropy_weight}.')
+    if not (0.0 <= cfg.id_candidate_entropy_min_ratio <= 1.0):
+        raise ValueError(
+            f'id_candidate_entropy_min_ratio should be within [0, 1], got {cfg.id_candidate_entropy_min_ratio}.'
+        )
     part_ce_writer = None
     part_ce_gate_sample_writer = None
     if cfg.part_ce and cfg.part_ce_log:
@@ -674,6 +680,7 @@ def main(gpu, cfg):
                                 candidate_topk=cfg.id_candidate_topk,
                                 cam_target=cfg.id_candidate_cam_target,
                                 score_type=cfg.id_candidate_score_type,
+                                include_noisy_label=cfg.id_candidate_include_noisy_label,
                                 cam_quantile=cfg.local_evidence_cam_quantile,
                                 min_area=cfg.local_evidence_min_area,
                                 max_area=cfg.local_evidence_max_area,
@@ -681,20 +688,35 @@ def main(gpu, cfg):
                                 cam_type=cfg.local_evidence_cam_type,
                             )
                             if id_candidate_batch['num_valid'] > 0:
-                                # C2 只用局部证据生成候选集合，PLL 仍约束 student 的全图预测概率质量。
+                                # C2-v2 用保守候选集合做全图 PLL，并记录熵约束强度用于诊断。
                                 candidate_positions = id_candidate_batch['batch_indices']
                                 candidate_mask = id_candidate_batch['candidate_mask']
-                                losses_id_candidate1, candidate_mass1 = compute_id_candidate_pll_loss(
-                                    logits1[candidate_positions], candidate_mask
+                                (
+                                    losses_id_candidate1, candidate_mass1,
+                                    student_entropy1, entropy_penalty1, pll_loss1
+                                ) = compute_id_candidate_pll_loss(
+                                    logits1[candidate_positions], candidate_mask,
+                                    entropy_weight=cfg.id_candidate_entropy_weight,
+                                    entropy_min_ratio=cfg.id_candidate_entropy_min_ratio,
                                 )
-                                losses_id_candidate2, candidate_mass2 = compute_id_candidate_pll_loss(
-                                    logits2[candidate_positions], candidate_mask
+                                (
+                                    losses_id_candidate2, candidate_mass2,
+                                    student_entropy2, entropy_penalty2, pll_loss2
+                                ) = compute_id_candidate_pll_loss(
+                                    logits2[candidate_positions], candidate_mask,
+                                    entropy_weight=cfg.id_candidate_entropy_weight,
+                                    entropy_min_ratio=cfg.id_candidate_entropy_min_ratio,
                                 )
                                 id_candidate_sample_loss = 0.5 * (losses_id_candidate1 + losses_id_candidate2)
                                 student_candidate_mass = 0.5 * (candidate_mass1 + candidate_mass2)
+                                student_candidate_entropy = 0.5 * (student_entropy1 + student_entropy2)
+                                entropy_penalty = 0.5 * (entropy_penalty1 + entropy_penalty2)
+                                id_candidate_pll_loss = 0.5 * (pll_loss1 + pll_loss2)
                                 id_candidate_loss = id_candidate_sample_loss.mean()
-                                id_candidate_batch['pll_loss'] = id_candidate_sample_loss
+                                id_candidate_batch['pll_loss'] = id_candidate_pll_loss
                                 id_candidate_batch['student_candidate_mass'] = student_candidate_mass
+                                id_candidate_batch['student_candidate_entropy'] = student_candidate_entropy
+                                id_candidate_batch['entropy_penalty'] = entropy_penalty
                                 loss = loss + cfg.id_candidate_weight * id_candidate_loss
                         if id_candidate_writer is not None:
                             id_candidate_row = build_id_candidate_log_row(
@@ -905,7 +927,9 @@ def check_args(args):
         'part_ce_gate_keep_ratio', 'part_ce_gate_start_epoch',
         'id_candidate', 'id_candidate_weight', 'id_candidate_topk',
         'id_candidate_start_epoch', 'id_candidate_log',
-        'id_candidate_cam_target', 'id_candidate_score_type'
+        'id_candidate_cam_target', 'id_candidate_score_type',
+        'id_candidate_include_noisy_label', 'id_candidate_entropy_weight',
+        'id_candidate_entropy_min_ratio'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -1038,6 +1062,12 @@ def parse_args():
                         help='C2 生成 CAM 的目标；第一版只支持 teacher_top1。')
     parser.add_argument('--id-candidate-score-type', type=str, default=None,
                         help='C2 候选打分方式；第一版只支持 ori_part_minus_erase。')
+    parser.add_argument('--id-candidate-include-noisy-label', action=argparse.BooleanOptionalAction, default=None,
+                        help='C2-v2 是否把 noisy label 强制并入候选集合，降低早期监督漂移。')
+    parser.add_argument('--id-candidate-entropy-weight', type=float, default=None,
+                        help='C2-v2 候选集合内熵下界惩罚权重。')
+    parser.add_argument('--id-candidate-entropy-min-ratio', type=float, default=None,
+                        help='C2-v2 熵下界占 log(|S|) 的比例。')
 
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
@@ -1073,7 +1103,7 @@ def parse_args():
     args.setdefault('part_ce_gate_threshold', 0.10)
     args.setdefault('part_ce_gate_keep_ratio', 0.50)
     args.setdefault('part_ce_gate_start_epoch', 20)
-    # C2 默认关闭；启用后独立写 ID 候选集合日志，不复用 clean 局部 CE 的 part_ce_groups。
+    # C2 默认关闭；启用后采用 v2 保守候选集合，且独立写 ID 候选集合日志。
     args.setdefault('id_candidate', False)
     args.setdefault('id_candidate_weight', 0.3)
     args.setdefault('id_candidate_topk', 5)
@@ -1081,6 +1111,9 @@ def parse_args():
     args.setdefault('id_candidate_log', True)
     args.setdefault('id_candidate_cam_target', 'teacher_top1')
     args.setdefault('id_candidate_score_type', 'ori_part_minus_erase')
+    args.setdefault('id_candidate_include_noisy_label', True)
+    args.setdefault('id_candidate_entropy_weight', 0.02)
+    args.setdefault('id_candidate_entropy_min_ratio', 0.50)
     # C1/C2 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()

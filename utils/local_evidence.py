@@ -37,13 +37,15 @@ ID_CANDIDATE_CSV_HEADER = (
     'epoch,batch_idx,num_selected,num_valid,id_candidate_loss,'
     'id_candidate_weight,weighted_id_candidate_loss,loss_ratio,'
     'candidate_topk,candidate_entropy_mean,student_candidate_mass_mean,'
-    'bbox_area_mean'
+    'bbox_area_mean,candidate_size_mean,student_candidate_entropy_mean,'
+    'entropy_penalty_mean'
 )
 
 ID_CANDIDATE_SAMPLE_CSV_HEADER = (
     'epoch,batch_idx,sample_id,noisy_label,cam_target,candidate_set,'
     'top1_candidate,candidate_scores,candidate_entropy,pll_loss,bbox_area,'
-    'pred_top1,pred_conf,noisy_label_in_candidate,top1_candidate_eq_noisy_label'
+    'pred_top1,pred_conf,noisy_label_in_candidate,top1_candidate_eq_noisy_label,'
+    'candidate_size,student_candidate_entropy,entropy_penalty'
 )
 
 
@@ -97,7 +99,10 @@ def format_id_candidate_row(row):
         f"{row['loss_ratio']:.6f},{row['candidate_topk']},"
         f"{row['candidate_entropy_mean']:.6f},"
         f"{row['student_candidate_mass_mean']:.6f},"
-        f"{row['bbox_area_mean']:.6f}"
+        f"{row['bbox_area_mean']:.6f},"
+        f"{row['candidate_size_mean']:.6f},"
+        f"{row['student_candidate_entropy_mean']:.6f},"
+        f"{row['entropy_penalty_mean']:.6f}"
     )
 
 
@@ -109,7 +114,9 @@ def format_id_candidate_sample_row(row):
         f"{row['candidate_entropy']:.6f},{row['pll_loss']:.6f},"
         f"{row['bbox_area']:.6f},{row['pred_top1']},"
         f"{row['pred_conf']:.6f},{row['noisy_label_in_candidate']},"
-        f"{row['top1_candidate_eq_noisy_label']}"
+        f"{row['top1_candidate_eq_noisy_label']},"
+        f"{row['candidate_size']},{row['student_candidate_entropy']:.6f},"
+        f"{row['entropy_penalty']:.6f}"
     )
 
 
@@ -268,6 +275,7 @@ def build_id_candidate_batch(
         candidate_topk=5,
         cam_target='teacher_top1',
         score_type='ori_part_minus_erase',
+        include_noisy_label=False,
         cam_quantile=0.8,
         min_area=0.05,
         max_area=0.7,
@@ -314,14 +322,22 @@ def build_id_candidate_batch(
     probs_erase = logits_erase.detach().softmax(dim=1)
     candidate_scores_all = probs_ori + probs_part - probs_erase
     actual_topk = min(candidate_topk, candidate_scores_all.size(1))
-    topk_scores, topk_indices = candidate_scores_all.topk(actual_topk, dim=1, largest=True, sorted=True)
-    candidate_entropy = _candidate_entropy(topk_scores)
+    _, topk_indices = candidate_scores_all.topk(actual_topk, dim=1, largest=True, sorted=True)
+    candidate_mask_all = _candidate_indices_to_mask(topk_indices, candidate_scores_all.size(1))
+    if include_noisy_label:
+        # C2-v2 强制保留 noisy label，避免候选监督过早退化成 teacher-top1 自训练。
+        noisy_labels = labels.to(device=candidate_mask_all.device, dtype=torch.long).view(-1, 1)
+        candidate_mask_all.scatter_(dim=1, index=noisy_labels, value=1.0)
+    candidate_indices, candidate_scores, candidate_size = _candidate_mask_to_padded_candidates(
+        candidate_mask_all, candidate_scores_all
+    )
+    candidate_entropy = _candidate_entropy(candidate_scores, candidate_size)
 
     bbox_areas = torch.tensor(bbox_areas, device=images.device, dtype=images.dtype)
     selected_bbox_areas = bbox_areas[selected_indices] if num_selected > 0 else bbox_areas[:0]
     valid_mask = torch.isfinite(selected_bbox_areas) & (selected_bbox_areas > 0)
     valid_indices = selected_indices[valid_mask]
-    candidate_mask = _candidate_indices_to_mask(topk_indices[valid_indices], candidate_scores_all.size(1))
+    candidate_mask = candidate_mask_all[valid_indices]
 
     return {
         'labels': labels[valid_indices],
@@ -330,8 +346,9 @@ def build_id_candidate_batch(
         'batch_indices': valid_indices,
         'bbox_area': bbox_areas[valid_indices],
         'cam_targets': cam_targets[valid_indices],
-        'candidate_indices': topk_indices[valid_indices],
-        'candidate_scores': topk_scores[valid_indices],
+        'candidate_indices': candidate_indices[valid_indices],
+        'candidate_scores': candidate_scores[valid_indices],
+        'candidate_size': candidate_size[valid_indices],
         'candidate_mask': candidate_mask,
         'candidate_entropy': candidate_entropy[valid_indices],
         'candidate_topk': int(actual_topk),
@@ -340,13 +357,22 @@ def build_id_candidate_batch(
     }
 
 
-def compute_id_candidate_pll_loss(logits, candidate_mask):
-    # C2 对候选集合做 PLL：只鼓励 student 把概率质量放入候选集合，不使用 hard web label。
+def compute_id_candidate_pll_loss(logits, candidate_mask, entropy_weight=0.0, entropy_min_ratio=0.0):
+    # C2-v2 在 PLL 外加入候选集合内熵下界，降低单个 top1 候选过快主导的风险。
     candidate_mask = candidate_mask.to(device=logits.device, dtype=logits.dtype)
     probs = logits.softmax(dim=1)
     candidate_mass = (probs * candidate_mask).sum(dim=1).clamp(min=1e-12)
-    losses = -torch.log(candidate_mass)
-    return losses, candidate_mass
+    pll_losses = -torch.log(candidate_mass)
+
+    candidate_distribution = (probs * candidate_mask) / candidate_mass[:, None]
+    student_candidate_entropy = -(
+        candidate_distribution * candidate_distribution.clamp(min=1e-12).log()
+    ).sum(dim=1)
+    candidate_size = candidate_mask.sum(dim=1).clamp(min=1.0)
+    entropy_floor = float(entropy_min_ratio) * candidate_size.log()
+    entropy_penalty = torch.relu(entropy_floor - student_candidate_entropy)
+    losses = pll_losses + float(entropy_weight) * entropy_penalty
+    return losses, candidate_mass, student_candidate_entropy, entropy_penalty, pll_losses
 
 
 def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
@@ -481,6 +507,16 @@ def build_id_candidate_log_row(epoch, batch_idx, candidate_batch, base_loss,
         student_candidate_mass_mean = 0.0
     else:
         student_candidate_mass_mean = _mean_or_zero(student_candidate_mass.detach())
+    student_candidate_entropy = candidate_batch.get('student_candidate_entropy')
+    if student_candidate_entropy is None:
+        student_candidate_entropy_mean = 0.0
+    else:
+        student_candidate_entropy_mean = _mean_or_zero(student_candidate_entropy.detach())
+    entropy_penalty = candidate_batch.get('entropy_penalty')
+    if entropy_penalty is None:
+        entropy_penalty_mean = 0.0
+    else:
+        entropy_penalty_mean = _mean_or_zero(entropy_penalty.detach())
 
     return {
         'epoch': int(epoch),
@@ -495,6 +531,9 @@ def build_id_candidate_log_row(epoch, batch_idx, candidate_batch, base_loss,
         'candidate_entropy_mean': _mean_or_zero(candidate_batch['candidate_entropy']),
         'student_candidate_mass_mean': student_candidate_mass_mean,
         'bbox_area_mean': _mean_or_zero(candidate_batch['bbox_area']),
+        'candidate_size_mean': _mean_or_zero(candidate_batch['candidate_size'].float()),
+        'student_candidate_entropy_mean': student_candidate_entropy_mean,
+        'entropy_penalty_mean': entropy_penalty_mean,
     }
 
 
@@ -514,6 +553,7 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
     cam_targets = candidate_batch['cam_targets'].detach().cpu().long()
     candidate_indices = candidate_batch['candidate_indices'].detach().cpu().long()
     candidate_scores = candidate_batch['candidate_scores'].detach().cpu()
+    candidate_size = candidate_batch['candidate_size'].detach().cpu().long()
     candidate_entropy = candidate_batch['candidate_entropy'].detach().cpu()
     bbox_area = candidate_batch['bbox_area'].detach().cpu()
     pll_loss = candidate_batch.get('pll_loss')
@@ -521,6 +561,16 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
         pll_loss = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
     else:
         pll_loss = pll_loss.detach().cpu()
+    student_candidate_entropy = candidate_batch.get('student_candidate_entropy')
+    if student_candidate_entropy is None:
+        student_candidate_entropy = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
+    else:
+        student_candidate_entropy = student_candidate_entropy.detach().cpu()
+    entropy_penalty = candidate_batch.get('entropy_penalty')
+    if entropy_penalty is None:
+        entropy_penalty = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
+    else:
+        entropy_penalty = entropy_penalty.detach().cpu()
 
     pred_top1 = torch.full((candidate_batch['num_valid'],), -1, dtype=torch.long)
     pred_conf = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
@@ -530,7 +580,10 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
 
     rows = []
     for i in range(candidate_batch['num_valid']):
-        candidate_set = candidate_indices[i].tolist()
+        row_candidate_size = int(candidate_size[i].item())
+        candidate_set = candidate_indices[i, :row_candidate_size].tolist()
+        candidate_score_values = candidate_scores[i, :row_candidate_size].tolist()
+        top1_candidate = int(candidate_set[0]) if row_candidate_size > 0 else -1
         noisy_label = int(labels[i].item())
         rows.append({
             'epoch': int(epoch),
@@ -539,15 +592,18 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
             'noisy_label': noisy_label,
             'cam_target': int(cam_targets[i].item()),
             'candidate_set': '|'.join(str(int(v)) for v in candidate_set),
-            'top1_candidate': int(candidate_indices[i, 0].item()),
-            'candidate_scores': '|'.join(f'{float(v):.6f}' for v in candidate_scores[i].tolist()),
+            'top1_candidate': top1_candidate,
+            'candidate_scores': '|'.join(f'{float(v):.6f}' for v in candidate_score_values),
             'candidate_entropy': float(candidate_entropy[i].item()),
             'pll_loss': float(pll_loss[i].item()),
             'bbox_area': float(bbox_area[i].item()),
             'pred_top1': int(pred_top1[i].item()),
             'pred_conf': float(pred_conf[i].item()),
             'noisy_label_in_candidate': int(noisy_label in candidate_set),
-            'top1_candidate_eq_noisy_label': int(int(candidate_indices[i, 0].item()) == noisy_label),
+            'top1_candidate_eq_noisy_label': int(top1_candidate == noisy_label),
+            'candidate_size': row_candidate_size,
+            'student_candidate_entropy': float(student_candidate_entropy[i].item()),
+            'entropy_penalty': float(entropy_penalty[i].item()),
         })
     return rows
 
@@ -609,6 +665,9 @@ def _empty_id_candidate_log_row(epoch, batch_idx, num_selected, num_valid,
         'candidate_entropy_mean': 0.0,
         'student_candidate_mass_mean': 0.0,
         'bbox_area_mean': 0.0,
+        'candidate_size_mean': 0.0,
+        'student_candidate_entropy_mean': 0.0,
+        'entropy_penalty_mean': 0.0,
     }
 
 
@@ -624,9 +683,22 @@ def _float_value(value):
     return float(value)
 
 
-def _candidate_entropy(candidate_scores):
-    # 候选分数不是概率，先在候选集合内 softmax，再统计候选集合离散程度。
-    candidate_probs = candidate_scores.softmax(dim=1)
+def _candidate_entropy(candidate_scores, candidate_size=None):
+    # 候选分数先在集合内 softmax；C2-v2 允许 noisy label 追加后出现变长候选集合。
+    if candidate_scores.numel() == 0:
+        return candidate_scores.new_zeros(candidate_scores.size(0))
+    if candidate_size is None:
+        candidate_probs = candidate_scores.softmax(dim=1)
+        return -(candidate_probs * candidate_probs.clamp(min=1e-12).log()).sum(dim=1)
+
+    candidate_size = candidate_size.to(device=candidate_scores.device, dtype=torch.long)
+    valid_positions = (
+        torch.arange(candidate_scores.size(1), device=candidate_scores.device)[None, :]
+        < candidate_size[:, None]
+    )
+    masked_scores = candidate_scores.masked_fill(~valid_positions, -1e9)
+    candidate_probs = masked_scores.softmax(dim=1) * valid_positions.to(dtype=candidate_scores.dtype)
+    candidate_probs = candidate_probs / candidate_probs.sum(dim=1, keepdim=True).clamp(min=1e-12)
     return -(candidate_probs * candidate_probs.clamp(min=1e-12).log()).sum(dim=1)
 
 
@@ -638,6 +710,31 @@ def _candidate_indices_to_mask(candidate_indices, num_classes):
     if candidate_indices.numel() > 0:
         candidate_mask.scatter_(dim=1, index=candidate_indices.long(), value=1.0)
     return candidate_mask
+
+
+def _candidate_mask_to_padded_candidates(candidate_mask, candidate_scores_all):
+    # 候选集合用 mask 训练、用按分数排序的 padding 列表写日志，二者解耦避免日志格式影响 loss。
+    candidate_size = candidate_mask.sum(dim=1).long()
+    max_size = int(candidate_size.max().item()) if candidate_size.numel() > 0 else 0
+    candidate_indices = torch.full(
+        (candidate_mask.size(0), max_size), -1,
+        device=candidate_mask.device, dtype=torch.long
+    )
+    candidate_scores = candidate_scores_all.new_zeros(candidate_mask.size(0), max_size)
+
+    for row_idx in range(candidate_mask.size(0)):
+        selected = torch.nonzero(candidate_mask[row_idx].bool(), as_tuple=False).flatten()
+        if selected.numel() == 0:
+            continue
+        selected_scores = candidate_scores_all[row_idx, selected]
+        order = selected_scores.argsort(descending=True)
+        selected = selected[order]
+        selected_scores = selected_scores[order]
+        row_size = int(selected.numel())
+        candidate_indices[row_idx, :row_size] = selected
+        candidate_scores[row_idx, :row_size] = selected_scores
+
+    return candidate_indices, candidate_scores, candidate_size
 
 
 def save_local_evidence_images(output_dir, rows, images, cam, x_part, x_erase, norm_mean, norm_std, max_samples=8):

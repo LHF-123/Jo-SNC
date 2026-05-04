@@ -57,16 +57,21 @@ part_ce_gate_threshold: 0.10
 part_ce_gate_keep_ratio: 0.50
 part_ce_gate_start_epoch: 20
 
-# C2 ID noisy candidate PLL
+# C2-v2 ID noisy candidate PLL
 # 使用 teacher top1 生成单个 CAM，再用 p_ori + p_part - p_erase 对所有类别打分取 TopK。
+# 候选集合强制并入 noisy label，避免早期完全变成 teacher-top1 自训练。
+# 熵约束只作用在候选集合内，防止 student 概率过快塌到单个候选。
 # C2 独立于 part_ce_groups；clean 局部 CE 仍只由 C1 的 part_ce_groups: clean 控制。
 id_candidate: true
-id_candidate_weight: 0.3
+id_candidate_weight: 0.05
 id_candidate_topk: 5
-id_candidate_start_epoch: 20
+id_candidate_start_epoch: 40
 id_candidate_log: true
 id_candidate_cam_target: teacher_top1
 id_candidate_score_type: ori_part_minus_erase
+id_candidate_include_noisy_label: true
+id_candidate_entropy_weight: 0.02
+id_candidate_entropy_min_ratio: 0.50
 
 # logging
 log_root: ./results/
