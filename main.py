@@ -35,14 +35,22 @@ from utils.eval import accuracy, evaluate, detection_evaluate
 from utils.utils import *
 from utils.loss import *
 from utils.local_evidence import (
+    ID_CANDIDATE_CSV_HEADER,
+    ID_CANDIDATE_SAMPLE_CSV_HEADER,
     LOCAL_EVIDENCE_CSV_HEADER,
     PART_CE_GATE_SAMPLE_CSV_HEADER,
     PART_CE_CSV_HEADER,
+    build_id_candidate_batch,
+    build_id_candidate_log_row,
+    build_id_candidate_sample_rows,
     build_gate_mask,
     build_local_part_batch,
     build_part_ce_gate_sample_rows,
     build_part_ce_log_row,
+    compute_id_candidate_pll_loss,
     compute_local_evidence,
+    format_id_candidate_row,
+    format_id_candidate_sample_row,
     format_local_evidence_row,
     format_part_ce_gate_sample_row,
     format_part_ce_row,
@@ -335,6 +343,12 @@ def main(gpu, cfg):
         raise ValueError(f'part_ce_gate_type should be fixed or percentile, got {cfg.part_ce_gate_type}.')
     if not (0.0 <= cfg.part_ce_gate_keep_ratio <= 1.0):
         raise ValueError(f'part_ce_gate_keep_ratio should be within [0, 1], got {cfg.part_ce_gate_keep_ratio}.')
+    if not (1 <= cfg.id_candidate_topk <= cfg.n_classes):
+        raise ValueError(f'id_candidate_topk should be within [1, {cfg.n_classes}], got {cfg.id_candidate_topk}.')
+    if cfg.id_candidate_cam_target not in ['teacher_top1']:
+        raise ValueError(f'id_candidate_cam_target should be teacher_top1, got {cfg.id_candidate_cam_target}.')
+    if cfg.id_candidate_score_type not in ['ori_part_minus_erase']:
+        raise ValueError(f'id_candidate_score_type should be ori_part_minus_erase, got {cfg.id_candidate_score_type}.')
     part_ce_writer = None
     part_ce_gate_sample_writer = None
     if cfg.part_ce and cfg.part_ce_log:
@@ -344,6 +358,16 @@ def main(gpu, cfg):
             root_dir=result_dir,
             filename='part_ce_gate_samples.csv',
             header=PART_CE_GATE_SAMPLE_CSV_HEADER,
+        )
+    id_candidate_writer = None
+    id_candidate_sample_writer = None
+    if cfg.id_candidate and cfg.id_candidate_log:
+        # C2 单独记录 ID noisy 候选集合质量和 PLL 强度，避免和 clean 局部 CE 日志混在一起。
+        id_candidate_writer = Writer(root_dir=result_dir, filename='id_candidate.csv', header=ID_CANDIDATE_CSV_HEADER)
+        id_candidate_sample_writer = Writer(
+            root_dir=result_dir,
+            filename='id_candidate_samples.csv',
+            header=ID_CANDIDATE_SAMPLE_CSV_HEADER,
         )
     local_evidence_writer = None
     local_evidence_image_dir = None
@@ -636,6 +660,58 @@ def main(gpu, cfg):
                             for row in gate_sample_rows:
                                 part_ce_gate_sample_writer.write(format_part_ce_gate_sample_row(row))
 
+                    if cfg.id_candidate:
+                        id_candidate_loss = loss.new_tensor(0.0)
+                        id_candidate_base_loss = loss.detach()
+                        id_candidate_batch = {
+                            'num_selected': int(idx_id.numel()),
+                            'num_valid': 0,
+                            'candidate_topk': cfg.id_candidate_topk,
+                        }
+                        if idx_id.numel() > 0 and (epoch + 1) >= cfg.id_candidate_start_epoch:
+                            id_candidate_batch = build_id_candidate_batch(
+                                k_model, x1, y, idx_id,
+                                candidate_topk=cfg.id_candidate_topk,
+                                cam_target=cfg.id_candidate_cam_target,
+                                score_type=cfg.id_candidate_score_type,
+                                cam_quantile=cfg.local_evidence_cam_quantile,
+                                min_area=cfg.local_evidence_min_area,
+                                max_area=cfg.local_evidence_max_area,
+                                bbox_padding=cfg.local_evidence_bbox_padding,
+                                cam_type=cfg.local_evidence_cam_type,
+                            )
+                            if id_candidate_batch['num_valid'] > 0:
+                                # C2 只用局部证据生成候选集合，PLL 仍约束 student 的全图预测概率质量。
+                                candidate_positions = id_candidate_batch['batch_indices']
+                                candidate_mask = id_candidate_batch['candidate_mask']
+                                losses_id_candidate1, candidate_mass1 = compute_id_candidate_pll_loss(
+                                    logits1[candidate_positions], candidate_mask
+                                )
+                                losses_id_candidate2, candidate_mass2 = compute_id_candidate_pll_loss(
+                                    logits2[candidate_positions], candidate_mask
+                                )
+                                id_candidate_sample_loss = 0.5 * (losses_id_candidate1 + losses_id_candidate2)
+                                student_candidate_mass = 0.5 * (candidate_mass1 + candidate_mass2)
+                                id_candidate_loss = id_candidate_sample_loss.mean()
+                                id_candidate_batch['pll_loss'] = id_candidate_sample_loss
+                                id_candidate_batch['student_candidate_mass'] = student_candidate_mass
+                                loss = loss + cfg.id_candidate_weight * id_candidate_loss
+                        if id_candidate_writer is not None:
+                            id_candidate_row = build_id_candidate_log_row(
+                                epoch + 1, it, id_candidate_batch,
+                                id_candidate_base_loss, id_candidate_loss,
+                                cfg.id_candidate_weight
+                            )
+                            id_candidate_writer.write(format_id_candidate_row(id_candidate_row))
+                        if id_candidate_sample_writer is not None and id_candidate_batch['num_valid'] > 0:
+                            # C2 样本日志记录候选集合和 noisy label 关系，支撑闭集错标修正分析。
+                            id_candidate_sample_rows = build_id_candidate_sample_rows(
+                                epoch + 1, it, id_candidate_batch, indices,
+                                student_logits=logits1,
+                            )
+                            for row in id_candidate_sample_rows:
+                                id_candidate_sample_writer.write(format_id_candidate_sample_row(row))
+
                     l1 = losses_cls_clean.mean().clone().detach().item() if idx_clean.size(0) > 0 else 0.000
                     l2 = losses_cls_id.mean().clone().detach().item() if idx_id.size(0) > 0 else 0.000
                     l3 = losses_cls_ood.mean().clone().detach().item() if idx_ood.size(0) > 0 else 0.000
@@ -826,7 +902,10 @@ def check_args(args):
         'local_evidence_save_images', 'local_evidence_image_max_samples',
         'part_ce', 'part_ce_weight', 'part_ce_groups', 'part_ce_use_teacher_cam', 'part_ce_log',
         'part_ce_gate', 'part_ce_gate_type', 'part_ce_gate_threshold',
-        'part_ce_gate_keep_ratio', 'part_ce_gate_start_epoch'
+        'part_ce_gate_keep_ratio', 'part_ce_gate_start_epoch',
+        'id_candidate', 'id_candidate_weight', 'id_candidate_topk',
+        'id_candidate_start_epoch', 'id_candidate_log',
+        'id_candidate_cam_target', 'id_candidate_score_type'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -944,11 +1023,29 @@ def parse_args():
     parser.add_argument('--part-ce-gate-start-epoch', type=int, default=None,
                         help='从第几个用户可见 epoch 开始启用 C1 门控局部 CE。')
 
+    # C2 ID noisy 候选标签：使用 teacher-top1 单 CAM 构造候选集合，再对 student 全图预测做 PLL。
+    parser.add_argument('--id-candidate', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 C2 ID noisy 局部证据候选标签 PLL 分支。')
+    parser.add_argument('--id-candidate-weight', type=float, default=None,
+                        help='C2 ID candidate PLL 加到总 loss 的权重。')
+    parser.add_argument('--id-candidate-topk', type=int, default=None,
+                        help='C2 每个 ID noisy 样本保留多少个候选类别。')
+    parser.add_argument('--id-candidate-start-epoch', type=int, default=None,
+                        help='从第几个用户可见 epoch 开始启用 C2 ID candidate PLL。')
+    parser.add_argument('--id-candidate-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 id_candidate.csv 和 id_candidate_samples.csv 诊断日志。')
+    parser.add_argument('--id-candidate-cam-target', type=str, default=None,
+                        help='C2 生成 CAM 的目标；第一版只支持 teacher_top1。')
+    parser.add_argument('--id-candidate-score-type', type=str, default=None,
+                        help='C2 候选打分方式；第一版只支持 ori_part_minus_erase。')
+
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
     gpu = parsed_args.gpu
     parsed_args = {k: v for k, v in vars(parsed_args).items() if v is not None and k not in ['cfg', 'gpu']}
-    args = yaml.load(open(cfg_path, 'r'), Loader=yaml.FullLoader)
+    # 配置文件按 UTF-8 读取，避免 Windows 默认 GBK 环境遇到中文注释时报解码错误。
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        args = yaml.load(f, Loader=yaml.FullLoader)
     args.update(parsed_args)
     # fdim 优先使用 YAML 或命令行显式值，仅在配置缺省时补默认值。
     if args.get('fdim') is None:
@@ -976,8 +1073,18 @@ def parse_args():
     args.setdefault('part_ce_gate_threshold', 0.10)
     args.setdefault('part_ce_gate_keep_ratio', 0.50)
     args.setdefault('part_ce_gate_start_epoch', 20)
-    # C1 门控类型统一小写，避免 YAML/命令行大小写差异导致误判。
+    # C2 默认关闭；启用后独立写 ID 候选集合日志，不复用 clean 局部 CE 的 part_ce_groups。
+    args.setdefault('id_candidate', False)
+    args.setdefault('id_candidate_weight', 0.3)
+    args.setdefault('id_candidate_topk', 5)
+    args.setdefault('id_candidate_start_epoch', 20)
+    args.setdefault('id_candidate_log', True)
+    args.setdefault('id_candidate_cam_target', 'teacher_top1')
+    args.setdefault('id_candidate_score_type', 'ori_part_minus_erase')
+    # C1/C2 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
+    args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()
+    args['id_candidate_score_type'] = str(args['id_candidate_score_type']).lower()
     assert check_args(args)
     return gpu, edict(args)
 

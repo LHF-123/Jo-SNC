@@ -33,6 +33,19 @@ PART_CE_GATE_SAMPLE_CSV_HEADER = (
     'p_ori_y,p_part_y,p_erase_y,erase_drop,bbox_area,pred_top1,pred_conf'
 )
 
+ID_CANDIDATE_CSV_HEADER = (
+    'epoch,batch_idx,num_selected,num_valid,id_candidate_loss,'
+    'id_candidate_weight,weighted_id_candidate_loss,loss_ratio,'
+    'candidate_topk,candidate_entropy_mean,student_candidate_mass_mean,'
+    'bbox_area_mean'
+)
+
+ID_CANDIDATE_SAMPLE_CSV_HEADER = (
+    'epoch,batch_idx,sample_id,noisy_label,cam_target,candidate_set,'
+    'top1_candidate,candidate_scores,candidate_entropy,pll_loss,bbox_area,'
+    'pred_top1,pred_conf,noisy_label_in_candidate,top1_candidate_eq_noisy_label'
+)
+
 
 def format_local_evidence_row(row):
     return (
@@ -72,6 +85,31 @@ def format_part_ce_gate_sample_row(row):
         f"{row['gate']},{row['p_ori_y']:.6f},{row['p_part_y']:.6f},"
         f"{row['p_erase_y']:.6f},{row['erase_drop']:.6f},"
         f"{row['bbox_area']:.6f},{row['pred_top1']},{row['pred_conf']:.6f}"
+    )
+
+
+def format_id_candidate_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['num_selected']},"
+        f"{row['num_valid']},{row['id_candidate_loss']:.6f},"
+        f"{row['id_candidate_weight']:.6f},"
+        f"{row['weighted_id_candidate_loss']:.6f},"
+        f"{row['loss_ratio']:.6f},{row['candidate_topk']},"
+        f"{row['candidate_entropy_mean']:.6f},"
+        f"{row['student_candidate_mass_mean']:.6f},"
+        f"{row['bbox_area_mean']:.6f}"
+    )
+
+
+def format_id_candidate_sample_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['sample_id']},"
+        f"{row['noisy_label']},{row['cam_target']},{row['candidate_set']},"
+        f"{row['top1_candidate']},{row['candidate_scores']},"
+        f"{row['candidate_entropy']:.6f},{row['pll_loss']:.6f},"
+        f"{row['bbox_area']:.6f},{row['pred_top1']},"
+        f"{row['pred_conf']:.6f},{row['noisy_label_in_candidate']},"
+        f"{row['top1_candidate_eq_noisy_label']}"
     )
 
 
@@ -222,6 +260,95 @@ def build_local_part_batch(
     }
 
 
+def build_id_candidate_batch(
+        model,
+        images,
+        labels,
+        selected_indices,
+        candidate_topk=5,
+        cam_target='teacher_top1',
+        score_type='ori_part_minus_erase',
+        cam_quantile=0.8,
+        min_area=0.05,
+        max_area=0.7,
+        bbox_padding=0.05,
+        cam_type='weightcam'):
+    selected_indices = selected_indices.detach().long()
+    num_selected = int(selected_indices.numel())
+    candidate_topk = max(1, int(candidate_topk))
+    cam_target = str(cam_target).lower()
+    score_type = str(score_type).lower()
+
+    if cam_target != 'teacher_top1':
+        raise ValueError(f'id_candidate_cam_target only supports teacher_top1, got {cam_target}.')
+    if score_type != 'ori_part_minus_erase':
+        raise ValueError(f'id_candidate_score_type only supports ori_part_minus_erase, got {score_type}.')
+
+    # C2 使用单个 teacher-top1 CAM 生成局部图，再用 ori+part-erase 对全类别打分。
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad(), _autocast_disabled(images):
+            images_float = images.float()
+            spatial_features, classifier_features = _extract_spatial_features(model, images_float)
+            logits_ori, class_weights = _classifier_weights(model.classifier, classifier_features)
+            cam_targets = logits_ori.detach().argmax(dim=1)
+            batch_indices = torch.arange(images.size(0), device=images.device)
+            target_weights = class_weights[batch_indices, cam_targets]
+            cam = _normalize_cam(_build_weight_cam(spatial_features, target_weights))
+
+            bboxes, bbox_areas, erase_masks = cam_to_bbox(
+                cam, images.shape[-2:], quantile=cam_quantile,
+                min_area=min_area, max_area=max_area, padding=bbox_padding
+            )
+            x_part = crop_by_bbox(images_float, bboxes)
+            x_erase = erase_by_mask(images_float, erase_masks, fill_value=0.0)
+            logits_part = _extract_logits(model(x_part))
+            logits_erase = _extract_logits(model(x_erase))
+    finally:
+        if was_training:
+            model.train()
+
+    probs_ori = logits_ori.detach().softmax(dim=1)
+    probs_part = logits_part.detach().softmax(dim=1)
+    probs_erase = logits_erase.detach().softmax(dim=1)
+    candidate_scores_all = probs_ori + probs_part - probs_erase
+    actual_topk = min(candidate_topk, candidate_scores_all.size(1))
+    topk_scores, topk_indices = candidate_scores_all.topk(actual_topk, dim=1, largest=True, sorted=True)
+    candidate_entropy = _candidate_entropy(topk_scores)
+
+    bbox_areas = torch.tensor(bbox_areas, device=images.device, dtype=images.dtype)
+    selected_bbox_areas = bbox_areas[selected_indices] if num_selected > 0 else bbox_areas[:0]
+    valid_mask = torch.isfinite(selected_bbox_areas) & (selected_bbox_areas > 0)
+    valid_indices = selected_indices[valid_mask]
+    candidate_mask = _candidate_indices_to_mask(topk_indices[valid_indices], candidate_scores_all.size(1))
+
+    return {
+        'labels': labels[valid_indices],
+        'selected_indices': selected_indices,
+        'valid_mask': valid_mask,
+        'batch_indices': valid_indices,
+        'bbox_area': bbox_areas[valid_indices],
+        'cam_targets': cam_targets[valid_indices],
+        'candidate_indices': topk_indices[valid_indices],
+        'candidate_scores': topk_scores[valid_indices],
+        'candidate_mask': candidate_mask,
+        'candidate_entropy': candidate_entropy[valid_indices],
+        'candidate_topk': int(actual_topk),
+        'num_selected': num_selected,
+        'num_valid': int(valid_indices.numel()),
+    }
+
+
+def compute_id_candidate_pll_loss(logits, candidate_mask):
+    # C2 对候选集合做 PLL：只鼓励 student 把概率质量放入候选集合，不使用 hard web label。
+    candidate_mask = candidate_mask.to(device=logits.device, dtype=logits.dtype)
+    probs = logits.softmax(dim=1)
+    candidate_mass = (probs * candidate_mask).sum(dim=1).clamp(min=1e-12)
+    losses = -torch.log(candidate_mass)
+    return losses, candidate_mass
+
+
 def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
                           part_ce_loss, part_ce_weight):
     num_selected = part_batch['num_selected']
@@ -331,6 +458,100 @@ def build_part_ce_gate_sample_rows(epoch, batch_idx, group, part_batch, sample_i
     return rows
 
 
+def build_id_candidate_log_row(epoch, batch_idx, candidate_batch, base_loss,
+                               id_candidate_loss, id_candidate_weight):
+    num_selected = candidate_batch['num_selected']
+    num_valid = candidate_batch['num_valid']
+    base_loss_value = float(base_loss.detach().item())
+    id_candidate_loss_value = float(id_candidate_loss.detach().item())
+    weighted_id_candidate_loss = float(id_candidate_weight) * id_candidate_loss_value
+    loss_ratio = weighted_id_candidate_loss / max(abs(base_loss_value), 1e-12)
+
+    if num_selected == 0 or num_valid == 0:
+        return _empty_id_candidate_log_row(
+            epoch, batch_idx, num_selected, num_valid,
+            id_candidate_loss_value, id_candidate_weight,
+            weighted_id_candidate_loss, loss_ratio,
+            candidate_batch.get('candidate_topk', 0)
+        )
+
+    # C2 batch 日志聚焦候选集合质量、student 概率质量和局部区域尺寸。
+    student_candidate_mass = candidate_batch.get('student_candidate_mass')
+    if student_candidate_mass is None:
+        student_candidate_mass_mean = 0.0
+    else:
+        student_candidate_mass_mean = _mean_or_zero(student_candidate_mass.detach())
+
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'num_selected': int(num_selected),
+        'num_valid': int(num_valid),
+        'id_candidate_loss': id_candidate_loss_value,
+        'id_candidate_weight': float(id_candidate_weight),
+        'weighted_id_candidate_loss': weighted_id_candidate_loss,
+        'loss_ratio': loss_ratio,
+        'candidate_topk': int(candidate_batch['candidate_topk']),
+        'candidate_entropy_mean': _mean_or_zero(candidate_batch['candidate_entropy']),
+        'student_candidate_mass_mean': student_candidate_mass_mean,
+        'bbox_area_mean': _mean_or_zero(candidate_batch['bbox_area']),
+    }
+
+
+def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_indices,
+                                   student_logits=None):
+    if candidate_batch['num_valid'] == 0:
+        return []
+
+    # C2 逐样本日志保留候选集合和 noisy label 关系，用于分析是否真正修正闭集错标。
+    batch_positions = candidate_batch['batch_indices'].detach().cpu().long()
+    if torch.is_tensor(sample_indices):
+        sample_ids = sample_indices.detach().cpu().long()[batch_positions]
+    else:
+        sample_ids = torch.tensor(sample_indices, dtype=torch.long)[batch_positions]
+
+    labels = candidate_batch['labels'].detach().cpu().long()
+    cam_targets = candidate_batch['cam_targets'].detach().cpu().long()
+    candidate_indices = candidate_batch['candidate_indices'].detach().cpu().long()
+    candidate_scores = candidate_batch['candidate_scores'].detach().cpu()
+    candidate_entropy = candidate_batch['candidate_entropy'].detach().cpu()
+    bbox_area = candidate_batch['bbox_area'].detach().cpu()
+    pll_loss = candidate_batch.get('pll_loss')
+    if pll_loss is None:
+        pll_loss = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
+    else:
+        pll_loss = pll_loss.detach().cpu()
+
+    pred_top1 = torch.full((candidate_batch['num_valid'],), -1, dtype=torch.long)
+    pred_conf = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
+    if student_logits is not None:
+        student_probs = student_logits.detach().softmax(dim=1).cpu()
+        pred_conf, pred_top1 = student_probs[batch_positions].max(dim=1)
+
+    rows = []
+    for i in range(candidate_batch['num_valid']):
+        candidate_set = candidate_indices[i].tolist()
+        noisy_label = int(labels[i].item())
+        rows.append({
+            'epoch': int(epoch),
+            'batch_idx': int(batch_idx),
+            'sample_id': int(sample_ids[i].item()),
+            'noisy_label': noisy_label,
+            'cam_target': int(cam_targets[i].item()),
+            'candidate_set': '|'.join(str(int(v)) for v in candidate_set),
+            'top1_candidate': int(candidate_indices[i, 0].item()),
+            'candidate_scores': '|'.join(f'{float(v):.6f}' for v in candidate_scores[i].tolist()),
+            'candidate_entropy': float(candidate_entropy[i].item()),
+            'pll_loss': float(pll_loss[i].item()),
+            'bbox_area': float(bbox_area[i].item()),
+            'pred_top1': int(pred_top1[i].item()),
+            'pred_conf': float(pred_conf[i].item()),
+            'noisy_label_in_candidate': int(noisy_label in candidate_set),
+            'top1_candidate_eq_noisy_label': int(int(candidate_indices[i, 0].item()) == noisy_label),
+        })
+    return rows
+
+
 def _part_ce_loss_values(josnc_loss, part_ce_loss, part_ce_weight):
     josnc_loss_value = float(josnc_loss.detach().item())
     part_ce_loss_value = float(part_ce_loss.detach().item())
@@ -371,6 +592,26 @@ def _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid,
     }
 
 
+def _empty_id_candidate_log_row(epoch, batch_idx, num_selected, num_valid,
+                                id_candidate_loss, id_candidate_weight,
+                                weighted_id_candidate_loss, loss_ratio,
+                                candidate_topk):
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'num_selected': int(num_selected),
+        'num_valid': int(num_valid),
+        'id_candidate_loss': float(id_candidate_loss),
+        'id_candidate_weight': float(id_candidate_weight),
+        'weighted_id_candidate_loss': float(weighted_id_candidate_loss),
+        'loss_ratio': float(loss_ratio),
+        'candidate_topk': int(candidate_topk),
+        'candidate_entropy_mean': 0.0,
+        'student_candidate_mass_mean': 0.0,
+        'bbox_area_mean': 0.0,
+    }
+
+
 def _mean_or_zero(values):
     if values.numel() == 0:
         return 0.0
@@ -381,6 +622,22 @@ def _float_value(value):
     if torch.is_tensor(value):
         return float(value.detach().item())
     return float(value)
+
+
+def _candidate_entropy(candidate_scores):
+    # 候选分数不是概率，先在候选集合内 softmax，再统计候选集合离散程度。
+    candidate_probs = candidate_scores.softmax(dim=1)
+    return -(candidate_probs * candidate_probs.clamp(min=1e-12).log()).sum(dim=1)
+
+
+def _candidate_indices_to_mask(candidate_indices, num_classes):
+    candidate_mask = torch.zeros(
+        candidate_indices.size(0), num_classes,
+        device=candidate_indices.device, dtype=torch.float
+    )
+    if candidate_indices.numel() > 0:
+        candidate_mask.scatter_(dim=1, index=candidate_indices.long(), value=1.0)
+    return candidate_mask
 
 
 def save_local_evidence_images(output_dir, rows, images, cam, x_part, x_erase, norm_mean, norm_std, max_samples=8):
