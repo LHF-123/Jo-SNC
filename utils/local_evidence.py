@@ -38,14 +38,18 @@ ID_CANDIDATE_CSV_HEADER = (
     'id_candidate_weight,weighted_id_candidate_loss,loss_ratio,'
     'candidate_topk,candidate_entropy_mean,student_candidate_mass_mean,'
     'bbox_area_mean,candidate_size_mean,student_candidate_entropy_mean,'
-    'entropy_penalty_mean'
+    'entropy_penalty_mean,candidate_dist_loss_mean,candidate_kl_mean,'
+    'student_top1_candidate_mass_mean,student_noisy_label_mass_mean,'
+    'target_top1_candidate_mass_mean,target_noisy_label_mass_mean'
 )
 
 ID_CANDIDATE_SAMPLE_CSV_HEADER = (
     'epoch,batch_idx,sample_id,noisy_label,cam_target,candidate_set,'
     'top1_candidate,candidate_scores,candidate_entropy,pll_loss,bbox_area,'
     'pred_top1,pred_conf,noisy_label_in_candidate,top1_candidate_eq_noisy_label,'
-    'candidate_size,student_candidate_entropy,entropy_penalty'
+    'candidate_size,student_candidate_entropy,entropy_penalty,'
+    'candidate_dist_loss,candidate_kl,student_top1_candidate_mass,'
+    'student_noisy_label_mass,target_top1_candidate_mass,target_noisy_label_mass'
 )
 
 
@@ -102,7 +106,13 @@ def format_id_candidate_row(row):
         f"{row['bbox_area_mean']:.6f},"
         f"{row['candidate_size_mean']:.6f},"
         f"{row['student_candidate_entropy_mean']:.6f},"
-        f"{row['entropy_penalty_mean']:.6f}"
+        f"{row['entropy_penalty_mean']:.6f},"
+        f"{row['candidate_dist_loss_mean']:.6f},"
+        f"{row['candidate_kl_mean']:.6f},"
+        f"{row['student_top1_candidate_mass_mean']:.6f},"
+        f"{row['student_noisy_label_mass_mean']:.6f},"
+        f"{row['target_top1_candidate_mass_mean']:.6f},"
+        f"{row['target_noisy_label_mass_mean']:.6f}"
     )
 
 
@@ -116,7 +126,11 @@ def format_id_candidate_sample_row(row):
         f"{row['pred_conf']:.6f},{row['noisy_label_in_candidate']},"
         f"{row['top1_candidate_eq_noisy_label']},"
         f"{row['candidate_size']},{row['student_candidate_entropy']:.6f},"
-        f"{row['entropy_penalty']:.6f}"
+        f"{row['entropy_penalty']:.6f},{row['candidate_dist_loss']:.6f},"
+        f"{row['candidate_kl']:.6f},{row['student_top1_candidate_mass']:.6f},"
+        f"{row['student_noisy_label_mass']:.6f},"
+        f"{row['target_top1_candidate_mass']:.6f},"
+        f"{row['target_noisy_label_mass']:.6f}"
     )
 
 
@@ -357,22 +371,125 @@ def build_id_candidate_batch(
     }
 
 
-def compute_id_candidate_pll_loss(logits, candidate_mask, entropy_weight=0.0, entropy_min_ratio=0.0):
-    # C2-v2 在 PLL 外加入候选集合内熵下界，降低单个 top1 候选过快主导的风险。
+def compute_id_candidate_loss(
+        logits,
+        candidate_mask,
+        candidate_indices=None,
+        candidate_scores=None,
+        candidate_size=None,
+        labels=None,
+        loss_type='pll_entropy',
+        entropy_weight=0.0,
+        entropy_min_ratio=0.0,
+        dist_weight=0.0,
+        target_temp=2.0,
+        top1_cap=0.5,
+        noisy_prior=0.0):
+    # C2-v2/v3 统一先计算 PLL 与候选集合内 student 分布，避免 main.py 堆叠 loss 细节。
+    loss_type = str(loss_type).lower()
     candidate_mask = candidate_mask.to(device=logits.device, dtype=logits.dtype)
     probs = logits.softmax(dim=1)
     candidate_mass = (probs * candidate_mask).sum(dim=1).clamp(min=1e-12)
-    pll_losses = -torch.log(candidate_mass)
+    candidate_mass_fp32 = candidate_mass.float().clamp(min=1e-12)
+    pll_losses = -torch.log(candidate_mass_fp32)
 
     candidate_distribution = (probs * candidate_mask) / candidate_mass[:, None]
+    candidate_distribution_fp32 = candidate_distribution.float()
     student_candidate_entropy = -(
-        candidate_distribution * candidate_distribution.clamp(min=1e-12).log()
+        candidate_distribution_fp32 * candidate_distribution_fp32.clamp(min=1e-12).log()
     ).sum(dim=1)
-    candidate_size = candidate_mask.sum(dim=1).clamp(min=1.0)
-    entropy_floor = float(entropy_min_ratio) * candidate_size.log()
+    candidate_size_from_mask = candidate_mask.sum(dim=1).float().clamp(min=1.0)
+    entropy_floor = float(entropy_min_ratio) * candidate_size_from_mask.log()
     entropy_penalty = torch.relu(entropy_floor - student_candidate_entropy)
-    losses = pll_losses + float(entropy_weight) * entropy_penalty
-    return losses, candidate_mass, student_candidate_entropy, entropy_penalty, pll_losses
+
+    losses = pll_losses
+    if loss_type in ['pll_entropy', 'capped_soft']:
+        losses = losses + float(entropy_weight) * entropy_penalty
+
+    batch_size = logits.size(0)
+    zeros = logits.new_zeros(batch_size).float()
+    result = {
+        'losses': losses,
+        'candidate_mass': candidate_mass,
+        'student_candidate_entropy': student_candidate_entropy,
+        'entropy_penalty': entropy_penalty,
+        'pll_losses': pll_losses,
+        'candidate_dist_loss': zeros,
+        'candidate_kl': zeros,
+        'student_top1_candidate_mass': zeros,
+        'student_noisy_label_mass': zeros,
+        'target_top1_candidate_mass': zeros,
+        'target_noisy_label_mass': zeros,
+    }
+
+    if loss_type != 'capped_soft':
+        return result
+
+    if candidate_indices is None or candidate_scores is None or labels is None:
+        raise ValueError(
+            'capped_soft id_candidate loss requires candidate_indices, candidate_scores, and labels.'
+        )
+
+    candidate_indices = candidate_indices.to(device=logits.device, dtype=torch.long)
+    candidate_scores = candidate_scores.to(device=logits.device, dtype=logits.dtype)
+    labels = labels.to(device=logits.device, dtype=torch.long)
+    if candidate_size is None:
+        candidate_size = candidate_size_from_mask.to(dtype=torch.long)
+    else:
+        candidate_size = candidate_size.to(device=logits.device, dtype=torch.long)
+    valid_positions = (
+        torch.arange(candidate_indices.size(1), device=logits.device)[None, :]
+        < candidate_size[:, None]
+    )
+
+    # C2-v3 构造 capped soft target，显式限制 top1 候选独占目标分布。
+    target_distribution = _build_capped_candidate_target(
+        candidate_scores, candidate_indices, candidate_size, labels,
+        target_temp=target_temp, top1_cap=top1_cap, noisy_prior=noisy_prior
+    )
+    safe_indices = candidate_indices.clamp(min=0)
+    student_candidate_probs = candidate_distribution.gather(1, safe_indices)
+    student_candidate_probs = student_candidate_probs * valid_positions.to(dtype=logits.dtype)
+    student_candidate_probs_fp32 = student_candidate_probs.float()
+    target_distribution_fp32 = target_distribution.float()
+    candidate_dist_loss = -(
+        target_distribution_fp32 * student_candidate_probs_fp32.clamp(min=1e-12).log()
+    ).sum(dim=1)
+    candidate_kl = (
+        target_distribution_fp32
+        * (
+            target_distribution_fp32.clamp(min=1e-12).log()
+            - student_candidate_probs_fp32.clamp(min=1e-12).log()
+        )
+    ).sum(dim=1)
+
+    noisy_positions = (candidate_indices == labels[:, None]) & valid_positions
+    result['losses'] = losses + float(dist_weight) * candidate_dist_loss
+    result['candidate_dist_loss'] = candidate_dist_loss
+    result['candidate_kl'] = candidate_kl
+    result['student_top1_candidate_mass'] = student_candidate_probs_fp32[:, 0]
+    result['student_noisy_label_mass'] = (
+        student_candidate_probs_fp32 * noisy_positions.to(dtype=student_candidate_probs_fp32.dtype)
+    ).sum(dim=1)
+    result['target_top1_candidate_mass'] = target_distribution_fp32[:, 0]
+    result['target_noisy_label_mass'] = (
+        target_distribution_fp32 * noisy_positions.to(dtype=target_distribution_fp32.dtype)
+    ).sum(dim=1)
+    return result
+
+
+def compute_id_candidate_pll_loss(logits, candidate_mask, entropy_weight=0.0, entropy_min_ratio=0.0):
+    result = compute_id_candidate_loss(
+        logits, candidate_mask,
+        loss_type='pll_entropy',
+        entropy_weight=entropy_weight,
+        entropy_min_ratio=entropy_min_ratio,
+    )
+    return (
+        result['losses'], result['candidate_mass'],
+        result['student_candidate_entropy'], result['entropy_penalty'],
+        result['pll_losses']
+    )
 
 
 def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
@@ -517,6 +634,12 @@ def build_id_candidate_log_row(epoch, batch_idx, candidate_batch, base_loss,
         entropy_penalty_mean = 0.0
     else:
         entropy_penalty_mean = _mean_or_zero(entropy_penalty.detach())
+    candidate_dist_loss = candidate_batch.get('candidate_dist_loss')
+    candidate_kl = candidate_batch.get('candidate_kl')
+    student_top1_candidate_mass = candidate_batch.get('student_top1_candidate_mass')
+    student_noisy_label_mass = candidate_batch.get('student_noisy_label_mass')
+    target_top1_candidate_mass = candidate_batch.get('target_top1_candidate_mass')
+    target_noisy_label_mass = candidate_batch.get('target_noisy_label_mass')
 
     return {
         'epoch': int(epoch),
@@ -534,6 +657,12 @@ def build_id_candidate_log_row(epoch, batch_idx, candidate_batch, base_loss,
         'candidate_size_mean': _mean_or_zero(candidate_batch['candidate_size'].float()),
         'student_candidate_entropy_mean': student_candidate_entropy_mean,
         'entropy_penalty_mean': entropy_penalty_mean,
+        'candidate_dist_loss_mean': _mean_or_zero_or_none(candidate_dist_loss),
+        'candidate_kl_mean': _mean_or_zero_or_none(candidate_kl),
+        'student_top1_candidate_mass_mean': _mean_or_zero_or_none(student_top1_candidate_mass),
+        'student_noisy_label_mass_mean': _mean_or_zero_or_none(student_noisy_label_mass),
+        'target_top1_candidate_mass_mean': _mean_or_zero_or_none(target_top1_candidate_mass),
+        'target_noisy_label_mass_mean': _mean_or_zero_or_none(target_noisy_label_mass),
     }
 
 
@@ -571,6 +700,12 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
         entropy_penalty = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
     else:
         entropy_penalty = entropy_penalty.detach().cpu()
+    candidate_dist_loss = _candidate_batch_vector_or_zeros(candidate_batch, 'candidate_dist_loss')
+    candidate_kl = _candidate_batch_vector_or_zeros(candidate_batch, 'candidate_kl')
+    student_top1_candidate_mass = _candidate_batch_vector_or_zeros(candidate_batch, 'student_top1_candidate_mass')
+    student_noisy_label_mass = _candidate_batch_vector_or_zeros(candidate_batch, 'student_noisy_label_mass')
+    target_top1_candidate_mass = _candidate_batch_vector_or_zeros(candidate_batch, 'target_top1_candidate_mass')
+    target_noisy_label_mass = _candidate_batch_vector_or_zeros(candidate_batch, 'target_noisy_label_mass')
 
     pred_top1 = torch.full((candidate_batch['num_valid'],), -1, dtype=torch.long)
     pred_conf = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
@@ -604,6 +739,12 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
             'candidate_size': row_candidate_size,
             'student_candidate_entropy': float(student_candidate_entropy[i].item()),
             'entropy_penalty': float(entropy_penalty[i].item()),
+            'candidate_dist_loss': float(candidate_dist_loss[i].item()),
+            'candidate_kl': float(candidate_kl[i].item()),
+            'student_top1_candidate_mass': float(student_top1_candidate_mass[i].item()),
+            'student_noisy_label_mass': float(student_noisy_label_mass[i].item()),
+            'target_top1_candidate_mass': float(target_top1_candidate_mass[i].item()),
+            'target_noisy_label_mass': float(target_noisy_label_mass[i].item()),
         })
     return rows
 
@@ -668,6 +809,12 @@ def _empty_id_candidate_log_row(epoch, batch_idx, num_selected, num_valid,
         'candidate_size_mean': 0.0,
         'student_candidate_entropy_mean': 0.0,
         'entropy_penalty_mean': 0.0,
+        'candidate_dist_loss_mean': 0.0,
+        'candidate_kl_mean': 0.0,
+        'student_top1_candidate_mass_mean': 0.0,
+        'student_noisy_label_mass_mean': 0.0,
+        'target_top1_candidate_mass_mean': 0.0,
+        'target_noisy_label_mass_mean': 0.0,
     }
 
 
@@ -675,6 +822,19 @@ def _mean_or_zero(values):
     if values.numel() == 0:
         return 0.0
     return float(values.detach().mean().item())
+
+
+def _mean_or_zero_or_none(values):
+    if values is None:
+        return 0.0
+    return _mean_or_zero(values.detach())
+
+
+def _candidate_batch_vector_or_zeros(candidate_batch, key):
+    value = candidate_batch.get(key)
+    if value is None:
+        return torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
+    return value.detach().cpu()
 
 
 def _float_value(value):
@@ -687,19 +847,91 @@ def _candidate_entropy(candidate_scores, candidate_size=None):
     # 候选分数先在集合内 softmax；C2-v2 允许 noisy label 追加后出现变长候选集合。
     if candidate_scores.numel() == 0:
         return candidate_scores.new_zeros(candidate_scores.size(0))
+    output_dtype = candidate_scores.dtype
+    candidate_scores_fp32 = candidate_scores.float()
     if candidate_size is None:
-        candidate_probs = candidate_scores.softmax(dim=1)
-        return -(candidate_probs * candidate_probs.clamp(min=1e-12).log()).sum(dim=1)
+        candidate_probs = candidate_scores_fp32.softmax(dim=1)
+        entropy = -(candidate_probs * candidate_probs.clamp(min=1e-12).log()).sum(dim=1)
+        return entropy.to(dtype=output_dtype)
 
-    candidate_size = candidate_size.to(device=candidate_scores.device, dtype=torch.long)
+    candidate_size = candidate_size.to(device=candidate_scores_fp32.device, dtype=torch.long)
     valid_positions = (
-        torch.arange(candidate_scores.size(1), device=candidate_scores.device)[None, :]
+        torch.arange(candidate_scores_fp32.size(1), device=candidate_scores_fp32.device)[None, :]
         < candidate_size[:, None]
     )
-    masked_scores = candidate_scores.masked_fill(~valid_positions, -1e9)
-    candidate_probs = masked_scores.softmax(dim=1) * valid_positions.to(dtype=candidate_scores.dtype)
+    # fp16 不能表示 -1e9，masked softmax 临时用 fp32 与 finfo 最小值规避溢出。
+    mask_value = torch.finfo(candidate_scores_fp32.dtype).min
+    masked_scores = candidate_scores_fp32.masked_fill(~valid_positions, mask_value)
+    candidate_probs = masked_scores.softmax(dim=1) * valid_positions.to(dtype=candidate_scores_fp32.dtype)
     candidate_probs = candidate_probs / candidate_probs.sum(dim=1, keepdim=True).clamp(min=1e-12)
-    return -(candidate_probs * candidate_probs.clamp(min=1e-12).log()).sum(dim=1)
+    entropy = -(candidate_probs * candidate_probs.clamp(min=1e-12).log()).sum(dim=1)
+    return entropy.to(dtype=output_dtype)
+
+
+def _build_capped_candidate_target(
+        candidate_scores,
+        candidate_indices,
+        candidate_size,
+        labels,
+        target_temp=2.0,
+        top1_cap=0.5,
+        noisy_prior=0.0):
+    # C2-v3 目标分布来自 evidence score，但给 top1 设上限，并给 noisy label 一个小保底。
+    if candidate_scores.numel() == 0:
+        return candidate_scores.new_zeros(candidate_scores.shape)
+
+    output_dtype = candidate_scores.dtype
+    candidate_scores_fp32 = candidate_scores.float()
+    candidate_indices = candidate_indices.to(device=candidate_scores_fp32.device, dtype=torch.long)
+    labels = labels.to(device=candidate_scores_fp32.device, dtype=torch.long)
+    candidate_size = candidate_size.to(device=candidate_scores_fp32.device, dtype=torch.long)
+    valid_positions = (
+        torch.arange(candidate_scores_fp32.size(1), device=candidate_scores_fp32.device)[None, :]
+        < candidate_size[:, None]
+    )
+    target_temp = max(float(target_temp), 1e-6)
+    # fp16 下 -1e9 会溢出，target 构造全程用 fp32 与 finfo 最小值，最后再转回原 dtype。
+    mask_value = torch.finfo(candidate_scores_fp32.dtype).min
+    masked_scores = (candidate_scores_fp32 / target_temp).masked_fill(~valid_positions, mask_value)
+    target = masked_scores.softmax(dim=1) * valid_positions.to(dtype=candidate_scores_fp32.dtype)
+    target = target / target.sum(dim=1, keepdim=True).clamp(min=1e-12)
+
+    top1_cap = max(0.0, min(float(top1_cap), 1.0))
+    if top1_cap < 1.0 and candidate_scores.size(1) > 1:
+        non_top1_positions = valid_positions.clone()
+        non_top1_positions[:, 0] = False
+        has_other = non_top1_positions.any(dim=1)
+        top1_excess = torch.relu(target[:, 0] - top1_cap)
+        top1_excess = torch.where(has_other, top1_excess, torch.zeros_like(top1_excess))
+        target[:, 0] = target[:, 0] - top1_excess
+        non_top1_mass = (target * non_top1_positions.to(dtype=target.dtype)).sum(dim=1).clamp(min=1e-12)
+        target = target + (
+            top1_excess[:, None]
+            * target
+            * non_top1_positions.to(dtype=target.dtype)
+            / non_top1_mass[:, None]
+        )
+
+    noisy_prior = max(0.0, min(float(noisy_prior), 1.0))
+    if noisy_prior > 0.0:
+        noisy_positions = (candidate_indices == labels[:, None]) & valid_positions
+        non_noisy_positions = valid_positions & noisy_positions.logical_not()
+        noisy_mass = (target * noisy_positions.to(dtype=target.dtype)).sum(dim=1)
+        non_noisy_mass = (target * non_noisy_positions.to(dtype=target.dtype)).sum(dim=1)
+        noisy_deficit = torch.relu(target.new_full(noisy_mass.shape, noisy_prior) - noisy_mass)
+        transfer = torch.minimum(noisy_deficit, non_noisy_mass)
+        target = target - (
+            transfer[:, None]
+            * target
+            * non_noisy_positions.to(dtype=target.dtype)
+            / non_noisy_mass.clamp(min=1e-12)[:, None]
+        )
+        noisy_count = noisy_positions.sum(dim=1).clamp(min=1).to(dtype=target.dtype)
+        target = target + transfer[:, None] * noisy_positions.to(dtype=target.dtype) / noisy_count[:, None]
+
+    target = target * valid_positions.to(dtype=target.dtype)
+    target = target / target.sum(dim=1, keepdim=True).clamp(min=1e-12)
+    return target.to(dtype=output_dtype)
 
 
 def _candidate_indices_to_mask(candidate_indices, num_classes):
