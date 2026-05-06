@@ -57,10 +57,10 @@ part_ce_gate_threshold: 0.10
 part_ce_gate_keep_ratio: 0.50
 part_ce_gate_start_epoch: 20
 
-# C2-v3 ID noisy candidate capped soft target
+# C2-v4 ID noisy candidate capped soft target
 # 使用 teacher top1 生成单个 CAM，再用 p_ori + p_part - p_erase 对所有类别打分取 TopK。
-# 候选集合强制并入 noisy label，避免早期完全变成 teacher-top1 自训练。
-# capped_soft 在候选集合内构造软目标，限制 top1 独占，并给 noisy label 小保底。
+# 候选集合强制并入 noisy label；capped_soft 在集合内限制 candidate top1 独占。
+# v4 从后期线性衰减 C2 权重，并跳过 teacher 原图 top1 过强的 ID 样本，减少后期自训练牵引。
 # C2 独立于 part_ce_groups；clean 局部 CE 仍只由 C1 的 part_ce_groups: clean 控制。
 id_candidate: true
 id_candidate_weight: 0.1
@@ -75,9 +75,14 @@ id_candidate_entropy_min_ratio: 0.50
 
 id_candidate_loss_type: capped_soft
 id_candidate_dist_weight: 0.5
-id_candidate_target_temp: 2.0
+id_candidate_target_temp: 1.0
 id_candidate_top1_cap: 0.5
 id_candidate_noisy_prior: 0.05
+
+id_candidate_decay_start_epoch: 80
+id_candidate_decay_end_epoch: 120
+id_candidate_min_weight: 0.01
+id_candidate_max_top1_prob: 0.7
 
 # logging
 log_root: ./results/

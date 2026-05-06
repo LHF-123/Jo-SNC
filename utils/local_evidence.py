@@ -40,7 +40,10 @@ ID_CANDIDATE_CSV_HEADER = (
     'bbox_area_mean,candidate_size_mean,student_candidate_entropy_mean,'
     'entropy_penalty_mean,candidate_dist_loss_mean,candidate_kl_mean,'
     'student_top1_candidate_mass_mean,student_noisy_label_mass_mean,'
-    'target_top1_candidate_mass_mean,target_noisy_label_mass_mean'
+    'target_top1_candidate_mass_mean,target_noisy_label_mass_mean,'
+    'effective_id_candidate_weight,num_conf_filtered,conf_filter_ratio,'
+    'teacher_top1_prob_mean,teacher_top1_prob_gated_mean,'
+    'teacher_top1_prob_filtered_mean'
 )
 
 ID_CANDIDATE_SAMPLE_CSV_HEADER = (
@@ -49,7 +52,9 @@ ID_CANDIDATE_SAMPLE_CSV_HEADER = (
     'pred_top1,pred_conf,noisy_label_in_candidate,top1_candidate_eq_noisy_label,'
     'candidate_size,student_candidate_entropy,entropy_penalty,'
     'candidate_dist_loss,candidate_kl,student_top1_candidate_mass,'
-    'student_noisy_label_mass,target_top1_candidate_mass,target_noisy_label_mass'
+    'student_noisy_label_mass,target_top1_candidate_mass,target_noisy_label_mass,'
+    'teacher_top1_prob,conf_gate,effective_id_candidate_weight,'
+    'used_in_id_candidate_loss,skip_reason'
 )
 
 
@@ -112,7 +117,12 @@ def format_id_candidate_row(row):
         f"{row['student_top1_candidate_mass_mean']:.6f},"
         f"{row['student_noisy_label_mass_mean']:.6f},"
         f"{row['target_top1_candidate_mass_mean']:.6f},"
-        f"{row['target_noisy_label_mass_mean']:.6f}"
+        f"{row['target_noisy_label_mass_mean']:.6f},"
+        f"{row['effective_id_candidate_weight']:.6f},"
+        f"{row['num_conf_filtered']},{row['conf_filter_ratio']:.6f},"
+        f"{row['teacher_top1_prob_mean']:.6f},"
+        f"{row['teacher_top1_prob_gated_mean']:.6f},"
+        f"{row['teacher_top1_prob_filtered_mean']:.6f}"
     )
 
 
@@ -130,8 +140,39 @@ def format_id_candidate_sample_row(row):
         f"{row['candidate_kl']:.6f},{row['student_top1_candidate_mass']:.6f},"
         f"{row['student_noisy_label_mass']:.6f},"
         f"{row['target_top1_candidate_mass']:.6f},"
-        f"{row['target_noisy_label_mass']:.6f}"
+        f"{row['target_noisy_label_mass']:.6f},"
+        f"{row['teacher_top1_prob']:.6f},{row['conf_gate']},"
+        f"{row['effective_id_candidate_weight']:.6f},"
+        f"{row['used_in_id_candidate_loss']},{row['skip_reason']}"
     )
+
+
+def compute_id_candidate_effective_weight(
+        base_weight,
+        epoch,
+        start_epoch,
+        decay_start_epoch=0,
+        decay_end_epoch=0,
+        min_weight=0.0):
+    # C2-v4 在启动前不加 loss，启动后按可选线性衰减控制后期正则强度。
+    base_weight = float(base_weight)
+    min_weight = float(min_weight)
+    epoch = int(epoch)
+    start_epoch = int(start_epoch)
+    decay_start_epoch = int(decay_start_epoch)
+    decay_end_epoch = int(decay_end_epoch)
+
+    if epoch < start_epoch:
+        return 0.0
+    if decay_end_epoch <= decay_start_epoch or decay_start_epoch <= 0:
+        return base_weight
+    if epoch < decay_start_epoch:
+        return base_weight
+    if epoch >= decay_end_epoch:
+        return min_weight
+
+    progress = (epoch - decay_start_epoch) / float(decay_end_epoch - decay_start_epoch)
+    return base_weight + (min_weight - base_weight) * progress
 
 
 def generate_cam(model, images, cam_targets, cam_type='weightcam'):
@@ -294,7 +335,8 @@ def build_id_candidate_batch(
         min_area=0.05,
         max_area=0.7,
         bbox_padding=0.05,
-        cam_type='weightcam'):
+        cam_type='weightcam',
+        max_top1_prob=1.0):
     selected_indices = selected_indices.detach().long()
     num_selected = int(selected_indices.numel())
     candidate_topk = max(1, int(candidate_topk))
@@ -334,6 +376,7 @@ def build_id_candidate_batch(
     probs_ori = logits_ori.detach().softmax(dim=1)
     probs_part = logits_part.detach().softmax(dim=1)
     probs_erase = logits_erase.detach().softmax(dim=1)
+    teacher_top1_prob_all = probs_ori.gather(1, cam_targets.view(-1, 1)).squeeze(1)
     candidate_scores_all = probs_ori + probs_part - probs_erase
     actual_topk = min(candidate_topk, candidate_scores_all.size(1))
     _, topk_indices = candidate_scores_all.topk(actual_topk, dim=1, largest=True, sorted=True)
@@ -352,6 +395,13 @@ def build_id_candidate_batch(
     valid_mask = torch.isfinite(selected_bbox_areas) & (selected_bbox_areas > 0)
     valid_indices = selected_indices[valid_mask]
     candidate_mask = candidate_mask_all[valid_indices]
+    teacher_top1_prob = teacher_top1_prob_all[valid_indices]
+    # C2-v4 跳过 teacher 原图 top1 过强的 ID 样本，避免候选学习继续强化自训练 top1。
+    max_top1_prob = float(max_top1_prob)
+    if max_top1_prob < 1.0:
+        conf_gate = teacher_top1_prob < max_top1_prob
+    else:
+        conf_gate = torch.ones_like(teacher_top1_prob, dtype=torch.bool)
 
     return {
         'labels': labels[valid_indices],
@@ -365,6 +415,10 @@ def build_id_candidate_batch(
         'candidate_size': candidate_size[valid_indices],
         'candidate_mask': candidate_mask,
         'candidate_entropy': candidate_entropy[valid_indices],
+        'teacher_top1_prob': teacher_top1_prob,
+        'conf_gate': conf_gate,
+        'used_in_loss': torch.zeros_like(conf_gate, dtype=torch.bool),
+        'num_conf_filtered': int((~conf_gate).sum().item()),
         'candidate_topk': int(actual_topk),
         'num_selected': num_selected,
         'num_valid': int(valid_indices.numel()),
@@ -492,6 +546,32 @@ def compute_id_candidate_pll_loss(logits, candidate_mask, entropy_weight=0.0, en
     )
 
 
+def attach_id_candidate_loss_results(candidate_batch, result1, result2, used_mask):
+    # C2-v4 只把真实参与 loss 的样本写回 loss 指标，被过滤样本保留 0 以便样本级排查。
+    metric_keys = [
+        'candidate_mass',
+        'student_candidate_entropy',
+        'entropy_penalty',
+        'pll_losses',
+        'candidate_dist_loss',
+        'candidate_kl',
+        'student_top1_candidate_mass',
+        'student_noisy_label_mass',
+        'target_top1_candidate_mass',
+        'target_noisy_label_mass',
+    ]
+    num_valid = int(candidate_batch['num_valid'])
+    for metric_key in metric_keys:
+        batch_key = 'pll_loss' if metric_key == 'pll_losses' else metric_key
+        if metric_key == 'candidate_mass':
+            batch_key = 'student_candidate_mass'
+        metric_values = 0.5 * (result1[metric_key] + result2[metric_key])
+        full_values = metric_values.new_zeros(num_valid)
+        full_values[used_mask.to(device=metric_values.device)] = metric_values
+        candidate_batch[batch_key] = full_values
+    return candidate_batch
+
+
 def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
                           part_ce_loss, part_ce_weight):
     num_selected = part_batch['num_selected']
@@ -602,12 +682,16 @@ def build_part_ce_gate_sample_rows(epoch, batch_idx, group, part_batch, sample_i
 
 
 def build_id_candidate_log_row(epoch, batch_idx, candidate_batch, base_loss,
-                               id_candidate_loss, id_candidate_weight):
+                               id_candidate_loss, id_candidate_weight,
+                               effective_id_candidate_weight=None):
     num_selected = candidate_batch['num_selected']
     num_valid = candidate_batch['num_valid']
     base_loss_value = float(base_loss.detach().item())
     id_candidate_loss_value = float(id_candidate_loss.detach().item())
-    weighted_id_candidate_loss = float(id_candidate_weight) * id_candidate_loss_value
+    if effective_id_candidate_weight is None:
+        effective_id_candidate_weight = float(id_candidate_weight)
+    effective_id_candidate_weight = float(effective_id_candidate_weight)
+    weighted_id_candidate_loss = effective_id_candidate_weight * id_candidate_loss_value
     loss_ratio = weighted_id_candidate_loss / max(abs(base_loss_value), 1e-12)
 
     if num_selected == 0 or num_valid == 0:
@@ -615,31 +699,49 @@ def build_id_candidate_log_row(epoch, batch_idx, candidate_batch, base_loss,
             epoch, batch_idx, num_selected, num_valid,
             id_candidate_loss_value, id_candidate_weight,
             weighted_id_candidate_loss, loss_ratio,
-            candidate_batch.get('candidate_topk', 0)
+            candidate_batch.get('candidate_topk', 0),
+            effective_id_candidate_weight
         )
 
-    # C2 batch 日志聚焦候选集合质量、student 概率质量和局部区域尺寸。
+    # C2 batch 日志中 loss 相关均值只统计真实参与 C2 loss 的样本，避免高置信过滤样本的 0 占位稀释诊断。
+    used_in_loss = candidate_batch.get('used_in_loss')
+    used_metric_mask = None if used_in_loss is None else used_in_loss.detach().bool()
     student_candidate_mass = candidate_batch.get('student_candidate_mass')
-    if student_candidate_mass is None:
-        student_candidate_mass_mean = 0.0
-    else:
-        student_candidate_mass_mean = _mean_or_zero(student_candidate_mass.detach())
+    student_candidate_mass_mean = _mean_or_zero_or_none(student_candidate_mass, used_metric_mask)
     student_candidate_entropy = candidate_batch.get('student_candidate_entropy')
-    if student_candidate_entropy is None:
-        student_candidate_entropy_mean = 0.0
-    else:
-        student_candidate_entropy_mean = _mean_or_zero(student_candidate_entropy.detach())
+    student_candidate_entropy_mean = _mean_or_zero_or_none(student_candidate_entropy, used_metric_mask)
     entropy_penalty = candidate_batch.get('entropy_penalty')
-    if entropy_penalty is None:
-        entropy_penalty_mean = 0.0
-    else:
-        entropy_penalty_mean = _mean_or_zero(entropy_penalty.detach())
+    entropy_penalty_mean = _mean_or_zero_or_none(entropy_penalty, used_metric_mask)
     candidate_dist_loss = candidate_batch.get('candidate_dist_loss')
     candidate_kl = candidate_batch.get('candidate_kl')
     student_top1_candidate_mass = candidate_batch.get('student_top1_candidate_mass')
     student_noisy_label_mass = candidate_batch.get('student_noisy_label_mass')
     target_top1_candidate_mass = candidate_batch.get('target_top1_candidate_mass')
     target_noisy_label_mass = candidate_batch.get('target_noisy_label_mass')
+    teacher_top1_prob = candidate_batch.get('teacher_top1_prob')
+    conf_gate = candidate_batch.get('conf_gate')
+    if teacher_top1_prob is None:
+        teacher_top1_prob_mean = 0.0
+        teacher_top1_prob_gated_mean = 0.0
+        teacher_top1_prob_filtered_mean = 0.0
+        num_conf_filtered = 0
+        conf_filter_ratio = 0.0
+    else:
+        teacher_top1_prob = teacher_top1_prob.detach()
+        if conf_gate is None:
+            conf_gate = torch.ones_like(teacher_top1_prob, dtype=torch.bool)
+        else:
+            conf_gate = conf_gate.detach().to(device=teacher_top1_prob.device, dtype=torch.bool)
+        if used_metric_mask is None:
+            gated_mask = conf_gate
+        else:
+            gated_mask = used_metric_mask.to(device=teacher_top1_prob.device, dtype=torch.bool)
+        filtered_mask = ~conf_gate
+        num_conf_filtered = int(filtered_mask.sum().item())
+        conf_filter_ratio = num_conf_filtered / max(int(num_valid), 1)
+        teacher_top1_prob_mean = _mean_or_zero(teacher_top1_prob)
+        teacher_top1_prob_gated_mean = _mean_or_zero(teacher_top1_prob[gated_mask])
+        teacher_top1_prob_filtered_mean = _mean_or_zero(teacher_top1_prob[filtered_mask])
 
     return {
         'epoch': int(epoch),
@@ -657,12 +759,18 @@ def build_id_candidate_log_row(epoch, batch_idx, candidate_batch, base_loss,
         'candidate_size_mean': _mean_or_zero(candidate_batch['candidate_size'].float()),
         'student_candidate_entropy_mean': student_candidate_entropy_mean,
         'entropy_penalty_mean': entropy_penalty_mean,
-        'candidate_dist_loss_mean': _mean_or_zero_or_none(candidate_dist_loss),
-        'candidate_kl_mean': _mean_or_zero_or_none(candidate_kl),
-        'student_top1_candidate_mass_mean': _mean_or_zero_or_none(student_top1_candidate_mass),
-        'student_noisy_label_mass_mean': _mean_or_zero_or_none(student_noisy_label_mass),
-        'target_top1_candidate_mass_mean': _mean_or_zero_or_none(target_top1_candidate_mass),
-        'target_noisy_label_mass_mean': _mean_or_zero_or_none(target_noisy_label_mass),
+        'candidate_dist_loss_mean': _mean_or_zero_or_none(candidate_dist_loss, used_metric_mask),
+        'candidate_kl_mean': _mean_or_zero_or_none(candidate_kl, used_metric_mask),
+        'student_top1_candidate_mass_mean': _mean_or_zero_or_none(student_top1_candidate_mass, used_metric_mask),
+        'student_noisy_label_mass_mean': _mean_or_zero_or_none(student_noisy_label_mass, used_metric_mask),
+        'target_top1_candidate_mass_mean': _mean_or_zero_or_none(target_top1_candidate_mass, used_metric_mask),
+        'target_noisy_label_mass_mean': _mean_or_zero_or_none(target_noisy_label_mass, used_metric_mask),
+        'effective_id_candidate_weight': effective_id_candidate_weight,
+        'num_conf_filtered': num_conf_filtered,
+        'conf_filter_ratio': conf_filter_ratio,
+        'teacher_top1_prob_mean': teacher_top1_prob_mean,
+        'teacher_top1_prob_gated_mean': teacher_top1_prob_gated_mean,
+        'teacher_top1_prob_filtered_mean': teacher_top1_prob_filtered_mean,
     }
 
 
@@ -706,6 +814,18 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
     student_noisy_label_mass = _candidate_batch_vector_or_zeros(candidate_batch, 'student_noisy_label_mass')
     target_top1_candidate_mass = _candidate_batch_vector_or_zeros(candidate_batch, 'target_top1_candidate_mass')
     target_noisy_label_mass = _candidate_batch_vector_or_zeros(candidate_batch, 'target_noisy_label_mass')
+    teacher_top1_prob = _candidate_batch_vector_or_zeros(candidate_batch, 'teacher_top1_prob')
+    conf_gate = candidate_batch.get('conf_gate')
+    if conf_gate is None:
+        conf_gate = torch.ones(candidate_batch['num_valid'], dtype=torch.bool)
+    else:
+        conf_gate = conf_gate.detach().cpu().bool()
+    used_in_loss = candidate_batch.get('used_in_loss')
+    if used_in_loss is None:
+        used_in_loss = torch.zeros(candidate_batch['num_valid'], dtype=torch.bool)
+    else:
+        used_in_loss = used_in_loss.detach().cpu().bool()
+    effective_id_candidate_weight = float(candidate_batch.get('effective_id_candidate_weight', 0.0))
 
     pred_top1 = torch.full((candidate_batch['num_valid'],), -1, dtype=torch.long)
     pred_conf = torch.zeros(candidate_batch['num_valid'], dtype=torch.float)
@@ -720,6 +840,14 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
         candidate_score_values = candidate_scores[i, :row_candidate_size].tolist()
         top1_candidate = int(candidate_set[0]) if row_candidate_size > 0 else -1
         noisy_label = int(labels[i].item())
+        if bool(used_in_loss[i].item()):
+            skip_reason = 'used'
+        elif not bool(conf_gate[i].item()):
+            skip_reason = 'high_conf'
+        elif effective_id_candidate_weight <= 0.0:
+            skip_reason = 'zero_weight'
+        else:
+            skip_reason = 'skipped'
         rows.append({
             'epoch': int(epoch),
             'batch_idx': int(batch_idx),
@@ -745,6 +873,11 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
             'student_noisy_label_mass': float(student_noisy_label_mass[i].item()),
             'target_top1_candidate_mass': float(target_top1_candidate_mass[i].item()),
             'target_noisy_label_mass': float(target_noisy_label_mass[i].item()),
+            'teacher_top1_prob': float(teacher_top1_prob[i].item()),
+            'conf_gate': int(conf_gate[i].item()),
+            'effective_id_candidate_weight': effective_id_candidate_weight,
+            'used_in_id_candidate_loss': int(used_in_loss[i].item()),
+            'skip_reason': skip_reason,
         })
     return rows
 
@@ -792,7 +925,9 @@ def _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid,
 def _empty_id_candidate_log_row(epoch, batch_idx, num_selected, num_valid,
                                 id_candidate_loss, id_candidate_weight,
                                 weighted_id_candidate_loss, loss_ratio,
-                                candidate_topk):
+                                candidate_topk, effective_id_candidate_weight=None):
+    if effective_id_candidate_weight is None:
+        effective_id_candidate_weight = id_candidate_weight
     return {
         'epoch': int(epoch),
         'batch_idx': int(batch_idx),
@@ -815,6 +950,12 @@ def _empty_id_candidate_log_row(epoch, batch_idx, num_selected, num_valid,
         'student_noisy_label_mass_mean': 0.0,
         'target_top1_candidate_mass_mean': 0.0,
         'target_noisy_label_mass_mean': 0.0,
+        'effective_id_candidate_weight': float(effective_id_candidate_weight),
+        'num_conf_filtered': 0,
+        'conf_filter_ratio': 0.0,
+        'teacher_top1_prob_mean': 0.0,
+        'teacher_top1_prob_gated_mean': 0.0,
+        'teacher_top1_prob_filtered_mean': 0.0,
     }
 
 
@@ -824,10 +965,13 @@ def _mean_or_zero(values):
     return float(values.detach().mean().item())
 
 
-def _mean_or_zero_or_none(values):
+def _mean_or_zero_or_none(values, mask=None):
     if values is None:
         return 0.0
-    return _mean_or_zero(values.detach())
+    values = values.detach()
+    if mask is not None and values.numel() == mask.numel():
+        values = values[mask.to(device=values.device, dtype=torch.bool)]
+    return _mean_or_zero(values)
 
 
 def _candidate_batch_vector_or_zeros(candidate_batch, key):

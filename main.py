@@ -40,6 +40,7 @@ from utils.local_evidence import (
     LOCAL_EVIDENCE_CSV_HEADER,
     PART_CE_GATE_SAMPLE_CSV_HEADER,
     PART_CE_CSV_HEADER,
+    attach_id_candidate_loss_results,
     build_id_candidate_batch,
     build_id_candidate_log_row,
     build_id_candidate_sample_rows,
@@ -47,6 +48,7 @@ from utils.local_evidence import (
     build_local_part_batch,
     build_part_ce_gate_sample_rows,
     build_part_ce_log_row,
+    compute_id_candidate_effective_weight,
     compute_id_candidate_loss,
     compute_local_evidence,
     format_id_candidate_row,
@@ -351,6 +353,8 @@ def main(gpu, cfg):
         raise ValueError(f'id_candidate_score_type should be ori_part_minus_erase, got {cfg.id_candidate_score_type}.')
     if cfg.id_candidate_loss_type not in ['pll', 'pll_entropy', 'capped_soft']:
         raise ValueError(f'id_candidate_loss_type should be pll, pll_entropy, or capped_soft, got {cfg.id_candidate_loss_type}.')
+    if cfg.id_candidate_weight < 0.0:
+        raise ValueError(f'id_candidate_weight should be non-negative, got {cfg.id_candidate_weight}.')
     if cfg.id_candidate_entropy_weight < 0.0:
         raise ValueError(f'id_candidate_entropy_weight should be non-negative, got {cfg.id_candidate_entropy_weight}.')
     if not (0.0 <= cfg.id_candidate_entropy_min_ratio <= 1.0):
@@ -365,6 +369,18 @@ def main(gpu, cfg):
         raise ValueError(f'id_candidate_top1_cap should be within [0, 1], got {cfg.id_candidate_top1_cap}.')
     if not (0.0 <= cfg.id_candidate_noisy_prior <= 1.0):
         raise ValueError(f'id_candidate_noisy_prior should be within [0, 1], got {cfg.id_candidate_noisy_prior}.')
+    if cfg.id_candidate_decay_start_epoch < 0 or cfg.id_candidate_decay_end_epoch < 0:
+        raise ValueError('id_candidate decay epochs should be non-negative.')
+    if cfg.id_candidate_decay_end_epoch > 0 and cfg.id_candidate_decay_end_epoch < cfg.id_candidate_decay_start_epoch:
+        raise ValueError('id_candidate_decay_end_epoch should be >= id_candidate_decay_start_epoch.')
+    if not (0.0 <= cfg.id_candidate_min_weight <= cfg.id_candidate_weight):
+        raise ValueError(
+            f'id_candidate_min_weight should be within [0, id_candidate_weight], got {cfg.id_candidate_min_weight}.'
+        )
+    if not (0.0 <= cfg.id_candidate_max_top1_prob <= 1.0):
+        raise ValueError(
+            f'id_candidate_max_top1_prob should be within [0, 1], got {cfg.id_candidate_max_top1_prob}.'
+        )
     part_ce_writer = None
     part_ce_gate_sample_writer = None
     if cfg.part_ce and cfg.part_ce_log:
@@ -679,10 +695,19 @@ def main(gpu, cfg):
                     if cfg.id_candidate:
                         id_candidate_loss = loss.new_tensor(0.0)
                         id_candidate_base_loss = loss.detach()
+                        id_candidate_effective_weight = compute_id_candidate_effective_weight(
+                            cfg.id_candidate_weight,
+                            epoch + 1,
+                            cfg.id_candidate_start_epoch,
+                            decay_start_epoch=cfg.id_candidate_decay_start_epoch,
+                            decay_end_epoch=cfg.id_candidate_decay_end_epoch,
+                            min_weight=cfg.id_candidate_min_weight,
+                        )
                         id_candidate_batch = {
                             'num_selected': int(idx_id.numel()),
                             'num_valid': 0,
                             'candidate_topk': cfg.id_candidate_topk,
+                            'effective_id_candidate_weight': id_candidate_effective_weight,
                         }
                         if idx_id.numel() > 0 and (epoch + 1) >= cfg.id_candidate_start_epoch:
                             id_candidate_batch = build_id_candidate_batch(
@@ -696,68 +721,64 @@ def main(gpu, cfg):
                                 max_area=cfg.local_evidence_max_area,
                                 bbox_padding=cfg.local_evidence_bbox_padding,
                                 cam_type=cfg.local_evidence_cam_type,
+                                max_top1_prob=cfg.id_candidate_max_top1_prob,
                             )
+                            id_candidate_batch['effective_id_candidate_weight'] = id_candidate_effective_weight
                             if id_candidate_batch['num_valid'] > 0:
-                                # C2-v3 将候选集合构造与 loss 类型解耦，支持 capped soft target 诊断。
-                                candidate_positions = id_candidate_batch['batch_indices']
-                                candidate_mask = id_candidate_batch['candidate_mask']
-                                id_candidate_result1 = compute_id_candidate_loss(
-                                    logits1[candidate_positions], candidate_mask,
-                                    candidate_indices=id_candidate_batch['candidate_indices'],
-                                    candidate_scores=id_candidate_batch['candidate_scores'],
-                                    candidate_size=id_candidate_batch['candidate_size'],
-                                    labels=id_candidate_batch['labels'],
-                                    loss_type=cfg.id_candidate_loss_type,
-                                    entropy_weight=cfg.id_candidate_entropy_weight,
-                                    entropy_min_ratio=cfg.id_candidate_entropy_min_ratio,
-                                    dist_weight=cfg.id_candidate_dist_weight,
-                                    target_temp=cfg.id_candidate_target_temp,
-                                    top1_cap=cfg.id_candidate_top1_cap,
-                                    noisy_prior=cfg.id_candidate_noisy_prior,
-                                )
-                                id_candidate_result2 = compute_id_candidate_loss(
-                                    logits2[candidate_positions], candidate_mask,
-                                    candidate_indices=id_candidate_batch['candidate_indices'],
-                                    candidate_scores=id_candidate_batch['candidate_scores'],
-                                    candidate_size=id_candidate_batch['candidate_size'],
-                                    labels=id_candidate_batch['labels'],
-                                    loss_type=cfg.id_candidate_loss_type,
-                                    entropy_weight=cfg.id_candidate_entropy_weight,
-                                    entropy_min_ratio=cfg.id_candidate_entropy_min_ratio,
-                                    dist_weight=cfg.id_candidate_dist_weight,
-                                    target_temp=cfg.id_candidate_target_temp,
-                                    top1_cap=cfg.id_candidate_top1_cap,
-                                    noisy_prior=cfg.id_candidate_noisy_prior,
-                                )
-                                id_candidate_sample_loss = 0.5 * (
-                                    id_candidate_result1['losses'] + id_candidate_result2['losses']
-                                )
-                                id_candidate_loss = id_candidate_sample_loss.mean()
-                                id_candidate_metric_keys = [
-                                    'candidate_mass',
-                                    'student_candidate_entropy',
-                                    'entropy_penalty',
-                                    'pll_losses',
-                                    'candidate_dist_loss',
-                                    'candidate_kl',
-                                    'student_top1_candidate_mass',
-                                    'student_noisy_label_mass',
-                                    'target_top1_candidate_mass',
-                                    'target_noisy_label_mass',
-                                ]
-                                for metric_key in id_candidate_metric_keys:
-                                    batch_key = 'pll_loss' if metric_key == 'pll_losses' else metric_key
-                                    if metric_key == 'candidate_mass':
-                                        batch_key = 'student_candidate_mass'
-                                    id_candidate_batch[batch_key] = 0.5 * (
-                                        id_candidate_result1[metric_key] + id_candidate_result2[metric_key]
+                                # C2-v4 只让 teacher top1 不过强且当前权重非零的样本进入 ID candidate loss。
+                                loss_mask = id_candidate_batch['conf_gate'].to(device=x1.device, dtype=torch.bool)
+                                if id_candidate_effective_weight <= 0.0:
+                                    loss_mask = torch.zeros_like(loss_mask)
+                                id_candidate_batch['used_in_loss'] = loss_mask
+                                if int(loss_mask.sum().item()) > 0:
+                                    candidate_positions = id_candidate_batch['batch_indices'][loss_mask]
+                                    candidate_mask = id_candidate_batch['candidate_mask'][loss_mask]
+                                    candidate_indices = id_candidate_batch['candidate_indices'][loss_mask]
+                                    candidate_scores = id_candidate_batch['candidate_scores'][loss_mask]
+                                    candidate_size = id_candidate_batch['candidate_size'][loss_mask]
+                                    candidate_labels = id_candidate_batch['labels'][loss_mask]
+                                    id_candidate_result1 = compute_id_candidate_loss(
+                                        logits1[candidate_positions], candidate_mask,
+                                        candidate_indices=candidate_indices,
+                                        candidate_scores=candidate_scores,
+                                        candidate_size=candidate_size,
+                                        labels=candidate_labels,
+                                        loss_type=cfg.id_candidate_loss_type,
+                                        entropy_weight=cfg.id_candidate_entropy_weight,
+                                        entropy_min_ratio=cfg.id_candidate_entropy_min_ratio,
+                                        dist_weight=cfg.id_candidate_dist_weight,
+                                        target_temp=cfg.id_candidate_target_temp,
+                                        top1_cap=cfg.id_candidate_top1_cap,
+                                        noisy_prior=cfg.id_candidate_noisy_prior,
                                     )
-                                loss = loss + cfg.id_candidate_weight * id_candidate_loss
+                                    id_candidate_result2 = compute_id_candidate_loss(
+                                        logits2[candidate_positions], candidate_mask,
+                                        candidate_indices=candidate_indices,
+                                        candidate_scores=candidate_scores,
+                                        candidate_size=candidate_size,
+                                        labels=candidate_labels,
+                                        loss_type=cfg.id_candidate_loss_type,
+                                        entropy_weight=cfg.id_candidate_entropy_weight,
+                                        entropy_min_ratio=cfg.id_candidate_entropy_min_ratio,
+                                        dist_weight=cfg.id_candidate_dist_weight,
+                                        target_temp=cfg.id_candidate_target_temp,
+                                        top1_cap=cfg.id_candidate_top1_cap,
+                                        noisy_prior=cfg.id_candidate_noisy_prior,
+                                    )
+                                    id_candidate_sample_loss = 0.5 * (
+                                        id_candidate_result1['losses'] + id_candidate_result2['losses']
+                                    )
+                                    id_candidate_loss = id_candidate_sample_loss.mean()
+                                    attach_id_candidate_loss_results(
+                                        id_candidate_batch, id_candidate_result1, id_candidate_result2, loss_mask
+                                    )
+                                    loss = loss + id_candidate_effective_weight * id_candidate_loss
                         if id_candidate_writer is not None:
                             id_candidate_row = build_id_candidate_log_row(
                                 epoch + 1, it, id_candidate_batch,
                                 id_candidate_base_loss, id_candidate_loss,
-                                cfg.id_candidate_weight
+                                cfg.id_candidate_weight,
+                                id_candidate_effective_weight
                             )
                             id_candidate_writer.write(format_id_candidate_row(id_candidate_row))
                         if id_candidate_sample_writer is not None and id_candidate_batch['num_valid'] > 0:
@@ -966,7 +987,9 @@ def check_args(args):
         'id_candidate_include_noisy_label', 'id_candidate_entropy_weight',
         'id_candidate_entropy_min_ratio', 'id_candidate_loss_type',
         'id_candidate_dist_weight', 'id_candidate_target_temp',
-        'id_candidate_top1_cap', 'id_candidate_noisy_prior'
+        'id_candidate_top1_cap', 'id_candidate_noisy_prior',
+        'id_candidate_decay_start_epoch', 'id_candidate_decay_end_epoch',
+        'id_candidate_min_weight', 'id_candidate_max_top1_prob'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -1109,13 +1132,21 @@ def parse_args():
     parser.add_argument('--id-candidate-loss-type', type=str, default=None,
                         help='C2 loss 类型：pll、pll_entropy 或 capped_soft。')
     parser.add_argument('--id-candidate-dist-weight', type=float, default=None,
-                        help='C2-v3 capped soft target 分布约束权重。')
+                        help='C2 capped soft target 分布约束权重。')
     parser.add_argument('--id-candidate-target-temp', type=float, default=None,
-                        help='C2-v3 evidence score 构造目标分布时的 softmax 温度。')
+                        help='C2 evidence score 构造目标分布时的 softmax 温度。')
     parser.add_argument('--id-candidate-top1-cap', type=float, default=None,
-                        help='C2-v3 目标分布中 candidate top1 的最大质量。')
+                        help='C2 目标分布中 candidate top1 的最大质量。')
     parser.add_argument('--id-candidate-noisy-prior', type=float, default=None,
-                        help='C2-v3 目标分布中 noisy label 的最小保底质量。')
+                        help='C2 目标分布中 noisy label 的最小保底质量。')
+    parser.add_argument('--id-candidate-decay-start-epoch', type=int, default=None,
+                        help='C2-v4 从第几个用户可见 epoch 开始线性衰减 ID candidate loss 权重。')
+    parser.add_argument('--id-candidate-decay-end-epoch', type=int, default=None,
+                        help='C2-v4 到第几个用户可见 epoch 衰减到 id_candidate_min_weight。')
+    parser.add_argument('--id-candidate-min-weight', type=float, default=None,
+                        help='C2-v4 后期衰减后的最小 ID candidate loss 权重。')
+    parser.add_argument('--id-candidate-max-top1-prob', type=float, default=None,
+                        help='C2-v4 teacher 原图 top1 prob 高于等于该阈值时跳过 ID candidate loss。')
 
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
@@ -1151,7 +1182,7 @@ def parse_args():
     args.setdefault('part_ce_gate_threshold', 0.10)
     args.setdefault('part_ce_gate_keep_ratio', 0.50)
     args.setdefault('part_ce_gate_start_epoch', 20)
-    # C2 默认关闭；启用后可在 v2 PLL 熵约束和 v3 capped soft target 间切换。
+    # C2 默认关闭；启用后可在 PLL、熵约束、capped soft target 和 v4 衰减过滤间组合。
     args.setdefault('id_candidate', False)
     args.setdefault('id_candidate_weight', 0.3)
     args.setdefault('id_candidate_topk', 5)
@@ -1167,6 +1198,10 @@ def parse_args():
     args.setdefault('id_candidate_target_temp', 2.0)
     args.setdefault('id_candidate_top1_cap', 0.5)
     args.setdefault('id_candidate_noisy_prior', 0.05)
+    args.setdefault('id_candidate_decay_start_epoch', 0)
+    args.setdefault('id_candidate_decay_end_epoch', 0)
+    args.setdefault('id_candidate_min_weight', 0.0)
+    args.setdefault('id_candidate_max_top1_prob', 1.0)
     # C1/C2 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()
