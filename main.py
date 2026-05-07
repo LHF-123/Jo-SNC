@@ -38,6 +38,8 @@ from utils.local_evidence import (
     ID_CANDIDATE_CSV_HEADER,
     ID_CANDIDATE_SAMPLE_CSV_HEADER,
     LOCAL_EVIDENCE_CSV_HEADER,
+    MULTI_PART_CSV_HEADER,
+    MULTI_PART_SAMPLE_CSV_HEADER,
     PART_CE_GATE_SAMPLE_CSV_HEADER,
     PART_CE_CSV_HEADER,
     attach_id_candidate_loss_results,
@@ -51,9 +53,12 @@ from utils.local_evidence import (
     compute_id_candidate_effective_weight,
     compute_id_candidate_loss,
     compute_local_evidence,
+    compute_multi_part_evidence,
     format_id_candidate_row,
     format_id_candidate_sample_row,
     format_local_evidence_row,
+    format_multi_part_row,
+    format_multi_part_sample_row,
     format_part_ce_gate_sample_row,
     format_part_ce_row,
 )
@@ -251,6 +256,23 @@ def _should_run_local_evidence(cfg, epoch, batch_idx):
     return True
 
 
+def _should_run_multi_part(cfg, epoch, batch_idx):
+    # D1 多部位诊断从指定 epoch 后抽样运行，只写 CSV/图片，不参与反传。
+    if not cfg.multi_part:
+        return False
+    if not (cfg.multi_part_log or cfg.multi_part_save_images):
+        return False
+    if (epoch + 1) < cfg.multi_part_start_epoch:
+        return False
+    if cfg.multi_part_every <= 0:
+        return False
+    if ((epoch + 1 - cfg.multi_part_start_epoch) % cfg.multi_part_every) != 0:
+        return False
+    if cfg.multi_part_max_batches > 0 and batch_idx >= cfg.multi_part_max_batches:
+        return False
+    return True
+
+
 def generate_label_sets(batch_label_sets, nc):
     bs = batch_label_sets.size(0)
     label_sets = torch.zeros(bs, nc).to(batch_label_sets.device)
@@ -381,6 +403,20 @@ def main(gpu, cfg):
         raise ValueError(
             f'id_candidate_max_top1_prob should be within [0, 1], got {cfg.id_candidate_max_top1_prob}.'
         )
+    if cfg.multi_part_num_parts < 1:
+        raise ValueError(f'multi_part_num_parts should be >= 1, got {cfg.multi_part_num_parts}.')
+    if cfg.multi_part_start_epoch < 0:
+        raise ValueError(f'multi_part_start_epoch should be non-negative, got {cfg.multi_part_start_epoch}.')
+    if cfg.multi_part_every < 0 or cfg.multi_part_max_batches < 0:
+        raise ValueError('multi_part_every and multi_part_max_batches should be non-negative.')
+    if cfg.multi_part_image_max_samples < 0 or cfg.multi_part_image_samples_per_class < 1:
+        raise ValueError('multi_part_image_max_samples should be non-negative and samples_per_class should be >= 1.')
+    multi_part_groups = [item.strip().lower() for item in cfg.multi_part_groups.split(',') if item.strip()]
+    if len(multi_part_groups) == 0:
+        raise ValueError('multi_part_groups should include at least one of clean,id.')
+    invalid_multi_part_groups = [item for item in multi_part_groups if item not in ['clean', 'id']]
+    if invalid_multi_part_groups:
+        raise ValueError(f'multi_part_groups only supports clean,id, got {invalid_multi_part_groups}.')
     part_ce_writer = None
     part_ce_gate_sample_writer = None
     if cfg.part_ce and cfg.part_ce_log:
@@ -410,6 +446,22 @@ def main(gpu, cfg):
             # 可视化图片使用当前数据集的均值方差反归一化，保存到本次实验目录下。
             local_evidence_image_dir = os.path.join(result_dir, 'local_evidence_images')
             local_evidence_norm = get_dataset_normalization(cfg.dataset)
+    multi_part_writer = None
+    multi_part_sample_writer = None
+    multi_part_image_dir = None
+    multi_part_norm = None
+    if cfg.multi_part and cfg.multi_part_log:
+        # D1 CSV 日志独立于 A1/C1/C2，确保诊断不改变训练 loss 和既有 CSV 语义。
+        multi_part_writer = Writer(root_dir=result_dir, filename='multi_part.csv', header=MULTI_PART_CSV_HEADER)
+        multi_part_sample_writer = Writer(
+            root_dir=result_dir,
+            filename='multi_part_samples.csv',
+            header=MULTI_PART_SAMPLE_CSV_HEADER,
+        )
+    if cfg.multi_part and cfg.multi_part_save_images:
+        # D1 图片导出不依赖 CSV 开关，便于只看图不写样本级日志。
+        multi_part_image_dir = os.path.join(result_dir, 'multi_part_images')
+        multi_part_norm = get_dataset_normalization(cfg.dataset)
     if 'webvision' in cfg.dataset:
         test_acc_writer = Writer(root_dir=result_dir, filename='test_acc.csv', header='epoch,Top1Acc,Top5Acc,ImagenetTop1Acc,ImagenetTop5Acc')
     else:
@@ -823,6 +875,36 @@ def main(gpu, cfg):
                         for row in local_evidence_rows:
                             local_evidence_writer.write(format_local_evidence_row(row))
 
+                    if _should_run_multi_part(cfg, epoch, it):
+                        # D1 只读诊断：CAM 从累计擦除图生成，part 从原图裁剪，不把多部位结果加入 loss。
+                        multi_part_model = k_model if cfg.multi_part_use_teacher else q_model
+                        multi_part_rows, multi_part_sample_rows = compute_multi_part_evidence(
+                            multi_part_model, x1, y, indices, idx_clean, idx_id, idx_ood,
+                            epoch=epoch + 1,
+                            batch_idx=it,
+                            groups=cfg.multi_part_groups,
+                            num_parts=cfg.multi_part_num_parts,
+                            use_accum_erase=cfg.multi_part_use_accum_erase,
+                            top1_source='teacher_top1' if cfg.multi_part_use_teacher else 'student_top1',
+                            cam_quantile=cfg.local_evidence_cam_quantile,
+                            min_area=cfg.local_evidence_min_area,
+                            max_area=cfg.local_evidence_max_area,
+                            bbox_padding=cfg.local_evidence_bbox_padding,
+                            cam_type=cfg.local_evidence_cam_type,
+                            save_images=cfg.multi_part_save_images,
+                            image_dir=os.path.join(multi_part_image_dir, f'epoch_{epoch + 1:03d}') if multi_part_image_dir is not None else None,
+                            image_max_samples=cfg.multi_part_image_max_samples,
+                            image_samples_per_class=cfg.multi_part_image_samples_per_class,
+                            norm_mean=multi_part_norm[0] if multi_part_norm is not None else None,
+                            norm_std=multi_part_norm[1] if multi_part_norm is not None else None,
+                        )
+                        if multi_part_writer is not None:
+                            for row in multi_part_rows:
+                                multi_part_writer.write(format_multi_part_row(row))
+                        if multi_part_sample_writer is not None:
+                            for row in multi_part_sample_rows:
+                                multi_part_sample_writer.write(format_multi_part_sample_row(row))
+
                 # dequeue and enqueue
                 if queue_ptr + bs > cfg.queue_length:  # if last interation in each epoch is a small batch
                     n_tailing = cfg.queue_length - queue_ptr
@@ -989,7 +1071,12 @@ def check_args(args):
         'id_candidate_dist_weight', 'id_candidate_target_temp',
         'id_candidate_top1_cap', 'id_candidate_noisy_prior',
         'id_candidate_decay_start_epoch', 'id_candidate_decay_end_epoch',
-        'id_candidate_min_weight', 'id_candidate_max_top1_prob'
+        'id_candidate_min_weight', 'id_candidate_max_top1_prob',
+        'multi_part', 'multi_part_log', 'multi_part_num_parts',
+        'multi_part_groups', 'multi_part_start_epoch', 'multi_part_every',
+        'multi_part_max_batches', 'multi_part_use_teacher',
+        'multi_part_use_accum_erase', 'multi_part_save_images',
+        'multi_part_image_max_samples', 'multi_part_image_samples_per_class'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -1148,6 +1235,32 @@ def parse_args():
     parser.add_argument('--id-candidate-max-top1-prob', type=float, default=None,
                         help='C2-v4 teacher 原图 top1 prob 高于等于该阈值时跳过 ID candidate loss。')
 
+    # D1 多部位局部区域：只做 sequential CAM 诊断，不加 loss，不做 logits 聚合。
+    parser.add_argument('--multi-part', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 D1 多部位局部区域诊断；只写 CSV/可选图片，不影响训练 loss。')
+    parser.add_argument('--multi-part-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 multi_part.csv 和 multi_part_samples.csv。')
+    parser.add_argument('--multi-part-num-parts', type=int, default=None,
+                        help='D1 每个样本顺序生成多少个局部区域。')
+    parser.add_argument('--multi-part-groups', type=str, default=None,
+                        help='D1 诊断哪些 Jo-SNC 分组；支持 clean,id，默认 clean,id。')
+    parser.add_argument('--multi-part-start-epoch', type=int, default=None,
+                        help='D1 从第几个用户可见 epoch 开始记录多部位诊断。')
+    parser.add_argument('--multi-part-every', type=int, default=None,
+                        help='D1 每隔多少个 epoch 运行一次；按 start_epoch 对齐。')
+    parser.add_argument('--multi-part-max-batches', type=int, default=None,
+                        help='每个 D1 诊断 epoch 最多处理多少个 batch；0 表示不限制。')
+    parser.add_argument('--multi-part-use-teacher', action=argparse.BooleanOptionalAction, default=None,
+                        help='D1 是否使用 EMA teacher 生成 CAM 和 part 预测。')
+    parser.add_argument('--multi-part-use-accum-erase', action=argparse.BooleanOptionalAction, default=None,
+                        help='D1 是否对后续 CAM 使用累计擦除图。')
+    parser.add_argument('--multi-part-save-images', action='store_true', default=None,
+                        help='保存 D1 多部位可视化图片。')
+    parser.add_argument('--multi-part-image-max-samples', type=int, default=None,
+                        help='每个触发 batch 最多保存多少张 D1 可视化图片。')
+    parser.add_argument('--multi-part-image-samples-per-class', type=int, default=None,
+                        help='每个触发 batch 中每个 label 最多保存多少张 D1 可视化图片。')
+
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
     gpu = parsed_args.gpu
@@ -1202,11 +1315,27 @@ def parse_args():
     args.setdefault('id_candidate_decay_end_epoch', 0)
     args.setdefault('id_candidate_min_weight', 0.0)
     args.setdefault('id_candidate_max_top1_prob', 1.0)
-    # C1/C2 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
+    # D1 默认关闭；启用后只做多部位生成与诊断，不改变任何训练 loss。
+    args.setdefault('multi_part', False)
+    args.setdefault('multi_part_log', True)
+    args.setdefault('multi_part_num_parts', 3)
+    args.setdefault('multi_part_groups', 'clean,id')
+    args.setdefault('multi_part_start_epoch', 40)
+    args.setdefault('multi_part_every', 5)
+    args.setdefault('multi_part_max_batches', 20)
+    args.setdefault('multi_part_use_teacher', True)
+    args.setdefault('multi_part_use_accum_erase', True)
+    args.setdefault('multi_part_save_images', False)
+    args.setdefault('multi_part_image_max_samples', 8)
+    args.setdefault('multi_part_image_samples_per_class', 1)
+    # C1/C2/D1 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()
     args['id_candidate_score_type'] = str(args['id_candidate_score_type']).lower()
     args['id_candidate_loss_type'] = str(args['id_candidate_loss_type']).lower()
+    args['multi_part_groups'] = ','.join(
+        item.strip().lower() for item in str(args['multi_part_groups']).split(',') if item.strip()
+    )
     assert check_args(args)
     return gpu, edict(args)
 

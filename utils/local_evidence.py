@@ -57,6 +57,19 @@ ID_CANDIDATE_SAMPLE_CSV_HEADER = (
     'used_in_id_candidate_loss,skip_reason'
 )
 
+MULTI_PART_CSV_HEADER = (
+    'epoch,batch_idx,group,part_id,num_selected,num_valid,valid_part_ratio,'
+    'num_parts,bbox_area_mean,part_iou_max_mean,part_iou_prev_mean,'
+    'p_part_target_mean,p_part_label_mean,part_conf_mean,erase_accum_area_mean'
+)
+
+MULTI_PART_SAMPLE_CSV_HEADER = (
+    'epoch,batch_idx,sample_id,group,label,part_id,cam_target,cam_target_source,'
+    'bbox_x1,bbox_y1,bbox_x2,bbox_y2,bbox_area,part_pred,part_conf,'
+    'p_part_target,p_part_label,part_iou_prev,part_iou_max,erase_accum_area,'
+    'part_rank_conf,valid_part,erase_round'
+)
+
 
 def format_local_evidence_row(row):
     return (
@@ -144,6 +157,32 @@ def format_id_candidate_sample_row(row):
         f"{row['teacher_top1_prob']:.6f},{row['conf_gate']},"
         f"{row['effective_id_candidate_weight']:.6f},"
         f"{row['used_in_id_candidate_loss']},{row['skip_reason']}"
+    )
+
+
+def format_multi_part_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['group']},"
+        f"{row['part_id']},{row['num_selected']},{row['num_valid']},"
+        f"{row['valid_part_ratio']:.6f},{row['num_parts']},"
+        f"{row['bbox_area_mean']:.6f},{row['part_iou_max_mean']:.6f},"
+        f"{row['part_iou_prev_mean']:.6f},{row['p_part_target_mean']:.6f},"
+        f"{row['p_part_label_mean']:.6f},{row['part_conf_mean']:.6f},"
+        f"{row['erase_accum_area_mean']:.6f}"
+    )
+
+
+def format_multi_part_sample_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['sample_id']},"
+        f"{row['group']},{row['label']},{row['part_id']},"
+        f"{row['cam_target']},{row['cam_target_source']},"
+        f"{row['bbox_x1']},{row['bbox_y1']},{row['bbox_x2']},{row['bbox_y2']},"
+        f"{row['bbox_area']:.6f},{row['part_pred']},"
+        f"{row['part_conf']:.6f},{row['p_part_target']:.6f},"
+        f"{row['p_part_label']:.6f},{row['part_iou_prev']:.6f},"
+        f"{row['part_iou_max']:.6f},{row['erase_accum_area']:.6f},"
+        f"{row['part_rank_conf']},{row['valid_part']},{row['erase_round']}"
     )
 
 
@@ -423,6 +462,127 @@ def build_id_candidate_batch(
         'num_selected': num_selected,
         'num_valid': int(valid_indices.numel()),
     }
+
+
+def compute_multi_part_evidence(
+        model,
+        images,
+        labels,
+        sample_indices,
+        idx_clean,
+        idx_id,
+        idx_ood,
+        epoch,
+        batch_idx,
+        groups='clean,id',
+        num_parts=3,
+        use_accum_erase=True,
+        top1_source='teacher_top1',
+        cam_quantile=0.8,
+        min_area=0.05,
+        max_area=0.7,
+        bbox_padding=0.05,
+        cam_type='weightcam',
+        save_images=False,
+        image_dir=None,
+        image_max_samples=8,
+        image_samples_per_class=1,
+        norm_mean=None,
+        norm_std=None):
+    # D1 只读诊断：CAM 输入使用逐轮擦除图，part crop 始终从原图裁剪，不向训练 loss 传递梯度。
+    group_keys = _normalize_multi_part_groups(groups)
+    num_parts = max(1, int(num_parts))
+    if len(group_keys) == 0:
+        return [], []
+
+    idx_clean = idx_clean.detach().long()
+    idx_id = idx_id.detach().long()
+    idx_ood = idx_ood.detach().long()
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad(), _autocast_disabled(images):
+            images_float = images.float()
+            image_h, image_w = images.shape[-2:]
+            labels_long = labels.long()
+            logits_ori = _extract_logits(model(images_float))
+            top1_targets = logits_ori.detach().argmax(dim=1)
+            cam_targets = labels_long.clone()
+            cam_target_sources = ['skip'] * images.size(0)
+            for index in idx_clean.detach().cpu().tolist():
+                cam_target_sources[int(index)] = 'web_label'
+            if idx_id.numel() > 0:
+                cam_targets[idx_id] = top1_targets[idx_id]
+                for index in idx_id.detach().cpu().tolist():
+                    # D1 的 ID CAM target 来自调用方传入的诊断模型，显式记录 teacher/student 来源。
+                    cam_target_sources[int(index)] = str(top1_source)
+
+            previous_bboxes = []
+            part_records = []
+            erase_accum_mask = torch.zeros(
+                images.size(0), image_h, image_w, device=images.device, dtype=torch.bool
+            )
+            cam_input = images_float
+            for part_idx in range(num_parts):
+                cam, _ = generate_cam(model, cam_input, cam_targets, cam_type=cam_type)
+                bboxes, bbox_areas, erase_masks = cam_to_bbox(
+                    cam, images.shape[-2:], quantile=cam_quantile,
+                    min_area=min_area, max_area=max_area, padding=bbox_padding
+                )
+                erase_masks = erase_masks.bool()
+                erase_accum_mask = erase_accum_mask | erase_masks
+                x_part = crop_by_bbox(images_float, bboxes)
+                logits_part = _extract_logits(model(x_part))
+                probs_part = logits_part.detach().softmax(dim=1)
+                part_conf, part_pred = probs_part.max(dim=1)
+                p_part_target = probs_part.gather(1, cam_targets.view(-1, 1)).squeeze(1)
+                p_part_label = probs_part.gather(1, labels_long.view(-1, 1)).squeeze(1)
+                bbox_areas_tensor = torch.tensor(bbox_areas, device=images.device, dtype=images.dtype)
+                valid_part = torch.isfinite(bbox_areas_tensor) & (bbox_areas_tensor > 0)
+                part_iou_prev, part_iou_max = _multi_part_iou_vectors(
+                    bboxes, previous_bboxes, images.device, images.dtype
+                )
+                erase_accum_area = erase_accum_mask.float().mean(dim=(1, 2)).to(dtype=images.dtype)
+
+                part_records.append({
+                    'part_id': part_idx + 1,
+                    'bboxes': bboxes,
+                    'bbox_area': bbox_areas_tensor,
+                    'part_pred': part_pred,
+                    'part_conf': part_conf,
+                    'p_part_target': p_part_target,
+                    'p_part_label': p_part_label,
+                    'part_iou_prev': part_iou_prev,
+                    'part_iou_max': part_iou_max,
+                    'erase_accum_area': erase_accum_area,
+                    'valid_part': valid_part,
+                })
+                previous_bboxes.append(bboxes)
+
+                erase_mask_for_next_cam = erase_accum_mask if use_accum_erase else erase_masks
+                cam_input = erase_by_mask(images_float, erase_mask_for_next_cam, fill_value=0.0)
+            x_erase_accum = erase_by_mask(images_float, erase_accum_mask, fill_value=0.0)
+    finally:
+        if was_training:
+            model.train()
+
+    batch_rows = build_multi_part_log_rows(
+        epoch, batch_idx, part_records, idx_clean, idx_id,
+        group_keys=group_keys, num_parts=num_parts
+    )
+    sample_rows = build_multi_part_sample_rows(
+        epoch, batch_idx, part_records, labels, sample_indices,
+        idx_clean, idx_id, group_keys, cam_targets, cam_target_sources
+    )
+    if save_images:
+        save_multi_part_images(
+            image_dir, sample_rows, images.float(), x_erase_accum,
+            norm_mean=norm_mean, norm_std=norm_std,
+            max_samples=image_max_samples,
+            samples_per_class=image_samples_per_class,
+        )
+    return batch_rows, sample_rows
 
 
 def compute_id_candidate_loss(
@@ -882,6 +1042,149 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
     return rows
 
 
+def build_multi_part_log_rows(epoch, batch_idx, part_records, idx_clean, idx_id,
+                              group_keys=None, num_parts=3):
+    # D1 batch 日志按 group+part_id 展开，便于直接观察 part2/part3 是否退化或高度重叠。
+    if group_keys is None:
+        group_keys = ['clean', 'id']
+    group_specs = []
+    if 'clean' in group_keys:
+        group_specs.append(('clean', idx_clean.detach().long()))
+    if 'id' in group_keys:
+        group_specs.append(('ID', idx_id.detach().long()))
+
+    rows = []
+    for group_name, group_indices in group_specs:
+        num_selected = int(group_indices.numel())
+        for record in part_records:
+            if num_selected == 0:
+                rows.append(_empty_multi_part_log_row(
+                    epoch, batch_idx, group_name, record['part_id'], num_selected, int(num_parts)
+                ))
+                continue
+
+            valid_part = record['valid_part'][group_indices].detach().bool()
+            selected_indices = group_indices[valid_part]
+            num_valid = int(selected_indices.numel())
+            if num_valid == 0:
+                rows.append(_empty_multi_part_log_row(
+                    epoch, batch_idx, group_name, record['part_id'], num_selected, int(num_parts)
+                ))
+                continue
+
+            rows.append({
+                'epoch': int(epoch),
+                'batch_idx': int(batch_idx),
+                'group': group_name,
+                'part_id': int(record['part_id']),
+                'num_selected': num_selected,
+                'num_valid': num_valid,
+                'valid_part_ratio': float(num_valid / max(num_selected, 1)),
+                'num_parts': int(num_parts),
+                'bbox_area_mean': _mean_or_zero(record['bbox_area'][selected_indices]),
+                'part_iou_max_mean': _mean_or_zero(record['part_iou_max'][selected_indices]),
+                'part_iou_prev_mean': _mean_or_zero(record['part_iou_prev'][selected_indices]),
+                'p_part_target_mean': _mean_or_zero(record['p_part_target'][selected_indices]),
+                'p_part_label_mean': _mean_or_zero(record['p_part_label'][selected_indices]),
+                'part_conf_mean': _mean_or_zero(record['part_conf'][selected_indices]),
+                'erase_accum_area_mean': _mean_or_zero(record['erase_accum_area'][selected_indices]),
+            })
+    return rows
+
+
+def build_multi_part_sample_rows(epoch, batch_idx, part_records, labels, sample_indices,
+                                 idx_clean, idx_id, group_keys, cam_targets, cam_target_sources):
+    # D1 逐样本日志保留每个 part 的 bbox、置信度和与历史 part 的 IoU，支撑互补性分析。
+    if len(part_records) == 0:
+        return []
+
+    selected_specs = []
+    if 'clean' in group_keys:
+        selected_specs.extend(('clean', int(index)) for index in idx_clean.detach().cpu().tolist())
+    if 'id' in group_keys:
+        selected_specs.extend(('ID', int(index)) for index in idx_id.detach().cpu().tolist())
+    if len(selected_specs) == 0:
+        return []
+
+    if torch.is_tensor(sample_indices):
+        sample_ids = sample_indices.detach().cpu().long()
+    else:
+        sample_ids = torch.tensor(sample_indices, dtype=torch.long)
+    labels_cpu = labels.detach().cpu().long()
+    cam_targets_cpu = cam_targets.detach().cpu().long()
+
+    part_conf_stack = torch.stack([record['part_conf'].detach() for record in part_records], dim=0)
+    part_rank_conf = _rank_multi_part_confidence(part_conf_stack).detach().cpu().long()
+
+    rows = []
+    for group_name, batch_pos in selected_specs:
+        label = int(labels_cpu[batch_pos].item())
+        sample_id = int(sample_ids[batch_pos].item())
+        cam_target = int(cam_targets_cpu[batch_pos].item())
+        cam_target_source = cam_target_sources[batch_pos]
+        for part_idx, record in enumerate(part_records):
+            bbox = record['bboxes'][batch_pos]
+            x1, y1, x2, y2 = bbox
+            rows.append({
+                'epoch': int(epoch),
+                'batch_idx': int(batch_idx),
+                'sample_id': sample_id,
+                'batch_pos': int(batch_pos),
+                'group': group_name,
+                'label': label,
+                'part_id': int(record['part_id']),
+                'cam_target': cam_target,
+                'cam_target_source': cam_target_source,
+                'bbox_x1': int(x1),
+                'bbox_y1': int(y1),
+                'bbox_x2': int(x2),
+                'bbox_y2': int(y2),
+                'bbox_area': float(record['bbox_area'][batch_pos].detach().item()),
+                'part_pred': int(record['part_pred'][batch_pos].detach().item()),
+                'part_conf': float(record['part_conf'][batch_pos].detach().item()),
+                'p_part_target': float(record['p_part_target'][batch_pos].detach().item()),
+                'p_part_label': float(record['p_part_label'][batch_pos].detach().item()),
+                'part_iou_prev': float(record['part_iou_prev'][batch_pos].detach().item()),
+                'part_iou_max': float(record['part_iou_max'][batch_pos].detach().item()),
+                'erase_accum_area': float(record['erase_accum_area'][batch_pos].detach().item()),
+                'part_rank_conf': int(part_rank_conf[part_idx, batch_pos].item()),
+                'valid_part': int(record['valid_part'][batch_pos].detach().item()),
+                'erase_round': int(record['part_id']),
+            })
+    return rows
+
+
+def save_multi_part_images(output_dir, sample_rows, images, x_erase_accum,
+                           norm_mean, norm_std, max_samples=8, samples_per_class=1):
+    # D1 可视化按类别抽样保存，图像网格展示原图、每个 part 的 bbox 和最终累计擦除图。
+    if output_dir is None or max_samples <= 0 or len(sample_rows) == 0:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+
+    rows_by_sample = {}
+    for row in sample_rows:
+        rows_by_sample.setdefault(row['sample_id'], []).append(row)
+
+    selected_items = _select_multi_part_image_samples(rows_by_sample, max_samples, samples_per_class)
+    for sample_id, rows in selected_items:
+        rows = sorted(rows, key=lambda item: item['part_id'])
+        batch_pos = int(rows[0]['batch_pos'])
+        original = _tensor_to_pil(_denormalize_image(images[batch_pos], norm_mean, norm_std))
+        part_bbox_images = []
+        for row in rows:
+            part_view = original.copy()
+            bbox = (row['bbox_x1'], row['bbox_y1'], row['bbox_x2'], row['bbox_y2'])
+            _draw_bbox(part_view, bbox)
+            part_bbox_images.append(part_view)
+        erase_view = _tensor_to_pil(_denormalize_image(x_erase_accum[batch_pos], norm_mean, norm_std))
+        grid = _concat_images([original] + part_bbox_images + [erase_view])
+        filename = (
+            f"epoch_{rows[0]['epoch']:03d}_batch_{rows[0]['batch_idx']:05d}_"
+            f"sample_{sample_id}_label_{rows[0]['label']}_group_{rows[0]['group']}_parts.png"
+        )
+        grid.save(os.path.join(output_dir, filename))
+
+
 def _part_ce_loss_values(josnc_loss, part_ce_loss, part_ce_weight):
     josnc_loss_value = float(josnc_loss.detach().item())
     part_ce_loss_value = float(part_ce_loss.detach().item())
@@ -959,6 +1262,26 @@ def _empty_id_candidate_log_row(epoch, batch_idx, num_selected, num_valid,
     }
 
 
+def _empty_multi_part_log_row(epoch, batch_idx, group, part_id, num_selected, num_parts):
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'part_id': int(part_id),
+        'num_selected': int(num_selected),
+        'num_valid': 0,
+        'valid_part_ratio': 0.0,
+        'num_parts': int(num_parts),
+        'bbox_area_mean': 0.0,
+        'part_iou_max_mean': 0.0,
+        'part_iou_prev_mean': 0.0,
+        'p_part_target_mean': 0.0,
+        'p_part_label_mean': 0.0,
+        'part_conf_mean': 0.0,
+        'erase_accum_area_mean': 0.0,
+    }
+
+
 def _mean_or_zero(values):
     if values.numel() == 0:
         return 0.0
@@ -985,6 +1308,86 @@ def _float_value(value):
     if torch.is_tensor(value):
         return float(value.detach().item())
     return float(value)
+
+
+def _normalize_multi_part_groups(groups):
+    # D1 仅诊断 clean/ID，OOD 默认跳过，避免无目标集合的局部区域污染日志解释。
+    if isinstance(groups, str):
+        group_items = [item.strip().lower() for item in groups.split(',') if item.strip()]
+    else:
+        group_items = [str(item).strip().lower() for item in groups if str(item).strip()]
+    normalized = []
+    for item in group_items:
+        if item == 'id':
+            key = 'id'
+        elif item == 'clean':
+            key = 'clean'
+        else:
+            raise ValueError(f'multi_part_groups only supports clean,id, got {item}.')
+        if key not in normalized:
+            normalized.append(key)
+    return normalized
+
+
+def _multi_part_iou_vectors(bboxes, previous_bboxes, device, dtype):
+    if len(previous_bboxes) == 0:
+        zeros = torch.zeros(len(bboxes), device=device, dtype=dtype)
+        return zeros, zeros
+
+    prev_values = []
+    max_values = []
+    for sample_idx, bbox in enumerate(bboxes):
+        prev_iou = _bbox_iou(bbox, previous_bboxes[-1][sample_idx])
+        max_iou = max(_bbox_iou(bbox, prior_bboxes[sample_idx]) for prior_bboxes in previous_bboxes)
+        prev_values.append(prev_iou)
+        max_values.append(max_iou)
+    return (
+        torch.tensor(prev_values, device=device, dtype=dtype),
+        torch.tensor(max_values, device=device, dtype=dtype),
+    )
+
+
+def _bbox_iou(bbox_a, bbox_b):
+    ax1, ay1, ax2, ay2 = bbox_a
+    bx1, by1, bx2, by2 = bbox_b
+    inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = inter_w * inter_h
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return float(inter / union)
+
+
+def _rank_multi_part_confidence(part_conf_stack):
+    # part_rank_conf=1 表示该样本所有 part 中置信度最高的局部图。
+    order = part_conf_stack.argsort(dim=0, descending=True)
+    ranks = torch.empty_like(order)
+    rank_values = torch.arange(
+        1, part_conf_stack.size(0) + 1,
+        device=part_conf_stack.device, dtype=order.dtype
+    ).view(-1, 1).expand_as(order)
+    ranks.scatter_(0, order, rank_values)
+    return ranks
+
+
+def _select_multi_part_image_samples(rows_by_sample, max_samples, samples_per_class):
+    # D1 图片按 label 限制每类保存数量，同时保留总量上限，避免 Web-Bird 200 类时图片爆炸。
+    max_samples = max(0, int(max_samples))
+    samples_per_class = max(1, int(samples_per_class))
+    class_counts = {}
+    selected = []
+    for sample_id, rows in rows_by_sample.items():
+        if len(selected) >= max_samples:
+            break
+        label = int(rows[0]['label'])
+        if class_counts.get(label, 0) >= samples_per_class:
+            continue
+        class_counts[label] = class_counts.get(label, 0) + 1
+        selected.append((sample_id, rows))
+    return selected
 
 
 def _candidate_entropy(candidate_scores, candidate_size=None):
