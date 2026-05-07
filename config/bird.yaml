@@ -95,6 +95,9 @@ multi_part_every: 1
 multi_part_max_batches: 20
 multi_part_use_teacher: true
 multi_part_use_accum_erase: true
+multi_part_crop_mode: peak_window
+multi_part_window_ratio: 0.35
+multi_part_erase_mode: peak_window
 multi_part_save_images: true
 multi_part_image_max_samples: 32
 multi_part_image_samples_per_class: 1

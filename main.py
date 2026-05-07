@@ -411,6 +411,14 @@ def main(gpu, cfg):
         raise ValueError('multi_part_every and multi_part_max_batches should be non-negative.')
     if cfg.multi_part_image_max_samples < 0 or cfg.multi_part_image_samples_per_class < 1:
         raise ValueError('multi_part_image_max_samples should be non-negative and samples_per_class should be >= 1.')
+    if cfg.multi_part_crop_mode not in ['bbox', 'peak_window']:
+        raise ValueError(f'multi_part_crop_mode should be bbox or peak_window, got {cfg.multi_part_crop_mode}.')
+    if cfg.multi_part_erase_mode not in ['cam_mask', 'bbox', 'peak_window']:
+        raise ValueError(
+            f'multi_part_erase_mode should be cam_mask, bbox, or peak_window, got {cfg.multi_part_erase_mode}.'
+        )
+    if not (0.0 < cfg.multi_part_window_ratio <= 1.0):
+        raise ValueError(f'multi_part_window_ratio should be within (0, 1], got {cfg.multi_part_window_ratio}.')
     multi_part_groups = [item.strip().lower() for item in cfg.multi_part_groups.split(',') if item.strip()]
     if len(multi_part_groups) == 0:
         raise ValueError('multi_part_groups should include at least one of clean,id.')
@@ -886,6 +894,9 @@ def main(gpu, cfg):
                             num_parts=cfg.multi_part_num_parts,
                             use_accum_erase=cfg.multi_part_use_accum_erase,
                             top1_source='teacher_top1' if cfg.multi_part_use_teacher else 'student_top1',
+                            crop_mode=cfg.multi_part_crop_mode,
+                            window_ratio=cfg.multi_part_window_ratio,
+                            erase_mode=cfg.multi_part_erase_mode,
                             cam_quantile=cfg.local_evidence_cam_quantile,
                             min_area=cfg.local_evidence_min_area,
                             max_area=cfg.local_evidence_max_area,
@@ -1076,7 +1087,9 @@ def check_args(args):
         'multi_part_groups', 'multi_part_start_epoch', 'multi_part_every',
         'multi_part_max_batches', 'multi_part_use_teacher',
         'multi_part_use_accum_erase', 'multi_part_save_images',
-        'multi_part_image_max_samples', 'multi_part_image_samples_per_class'
+        'multi_part_image_max_samples', 'multi_part_image_samples_per_class',
+        'multi_part_crop_mode', 'multi_part_window_ratio',
+        'multi_part_erase_mode'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -1260,6 +1273,12 @@ def parse_args():
                         help='每个触发 batch 最多保存多少张 D1 可视化图片。')
     parser.add_argument('--multi-part-image-samples-per-class', type=int, default=None,
                         help='每个触发 batch 中每个 label 最多保存多少张 D1 可视化图片。')
+    parser.add_argument('--multi-part-crop-mode', type=str, default=None,
+                        help='D1 part crop 方式：bbox 使用 CAM 外接框，peak_window 使用 CAM 峰值固定窗口。')
+    parser.add_argument('--multi-part-window-ratio', type=float, default=None,
+                        help='D1 peak_window 的边长占图像边长比例。')
+    parser.add_argument('--multi-part-erase-mode', type=str, default=None,
+                        help='D1 下一轮 CAM 的擦除区域：cam_mask、bbox 或 peak_window。')
 
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
@@ -1328,11 +1347,16 @@ def parse_args():
     args.setdefault('multi_part_save_images', False)
     args.setdefault('multi_part_image_max_samples', 8)
     args.setdefault('multi_part_image_samples_per_class', 1)
+    args.setdefault('multi_part_crop_mode', 'bbox')
+    args.setdefault('multi_part_window_ratio', 0.35)
+    args.setdefault('multi_part_erase_mode', 'cam_mask')
     # C1/C2/D1 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()
     args['id_candidate_score_type'] = str(args['id_candidate_score_type']).lower()
     args['id_candidate_loss_type'] = str(args['id_candidate_loss_type']).lower()
+    args['multi_part_crop_mode'] = str(args['multi_part_crop_mode']).lower()
+    args['multi_part_erase_mode'] = str(args['multi_part_erase_mode']).lower()
     args['multi_part_groups'] = ','.join(
         item.strip().lower() for item in str(args['multi_part_groups']).split(',') if item.strip()
     )

@@ -60,14 +60,15 @@ ID_CANDIDATE_SAMPLE_CSV_HEADER = (
 MULTI_PART_CSV_HEADER = (
     'epoch,batch_idx,group,part_id,num_selected,num_valid,valid_part_ratio,'
     'num_parts,bbox_area_mean,part_iou_max_mean,part_iou_prev_mean,'
-    'p_part_target_mean,p_part_label_mean,part_conf_mean,erase_accum_area_mean'
+    'p_part_target_mean,p_part_label_mean,part_conf_mean,erase_accum_area_mean,'
+    'crop_mode,erase_mode,window_ratio'
 )
 
 MULTI_PART_SAMPLE_CSV_HEADER = (
     'epoch,batch_idx,sample_id,group,label,part_id,cam_target,cam_target_source,'
     'bbox_x1,bbox_y1,bbox_x2,bbox_y2,bbox_area,part_pred,part_conf,'
     'p_part_target,p_part_label,part_iou_prev,part_iou_max,erase_accum_area,'
-    'part_rank_conf,valid_part,erase_round'
+    'part_rank_conf,valid_part,erase_round,crop_mode,erase_mode,window_ratio'
 )
 
 
@@ -168,7 +169,8 @@ def format_multi_part_row(row):
         f"{row['bbox_area_mean']:.6f},{row['part_iou_max_mean']:.6f},"
         f"{row['part_iou_prev_mean']:.6f},{row['p_part_target_mean']:.6f},"
         f"{row['p_part_label_mean']:.6f},{row['part_conf_mean']:.6f},"
-        f"{row['erase_accum_area_mean']:.6f}"
+        f"{row['erase_accum_area_mean']:.6f},{row['crop_mode']},"
+        f"{row['erase_mode']},{row['window_ratio']:.6f}"
     )
 
 
@@ -182,7 +184,8 @@ def format_multi_part_sample_row(row):
         f"{row['part_conf']:.6f},{row['p_part_target']:.6f},"
         f"{row['p_part_label']:.6f},{row['part_iou_prev']:.6f},"
         f"{row['part_iou_max']:.6f},{row['erase_accum_area']:.6f},"
-        f"{row['part_rank_conf']},{row['valid_part']},{row['erase_round']}"
+        f"{row['part_rank_conf']},{row['valid_part']},{row['erase_round']},"
+        f"{row['crop_mode']},{row['erase_mode']},{row['window_ratio']:.6f}"
     )
 
 
@@ -242,6 +245,33 @@ def cam_to_bbox(cam, image_size, quantile=0.8, min_area=0.05, max_area=0.7, padd
         bboxes.append(bbox)
         areas.append(area)
         masks.append(mask)
+    return bboxes, areas, torch.stack(masks, dim=0).to(device=cam.device)
+
+
+def cam_to_peak_window(cam, image_size, window_ratio=0.35):
+    # D1-v2 固定窗口以 CAM peak 为中心，避免多个高响应点的外接框退化成大框。
+    image_h, image_w = image_size
+    bboxes, areas, masks = [], [], []
+    cam = cam.float()
+    window_ratio = max(1e-6, min(float(window_ratio), 1.0))
+    window_w = max(1, int(round(image_w * window_ratio)))
+    window_h = max(1, int(round(image_h * window_ratio)))
+    for cam_i in cam:
+        cam_h, cam_w = cam_i.shape
+        if cam_i.max() <= 0:
+            cx = image_w / 2.0
+            cy = image_h / 2.0
+        else:
+            peak_idx = int(cam_i.flatten().argmax().item())
+            peak_y, peak_x = divmod(peak_idx, cam_w)
+            cx = (peak_x + 0.5) * image_w / float(cam_w)
+            cy = (peak_y + 0.5) * image_h / float(cam_h)
+        bbox = _fixed_size_bbox_around_center(cx, cy, window_w, window_h, image_h, image_w)
+        x1, y1, x2, y2 = bbox
+        area = ((x2 - x1) * (y2 - y1)) / float(image_h * image_w)
+        bboxes.append(bbox)
+        areas.append(area)
+        masks.append(_bbox_mask(image_h, image_w, bbox, cam.device))
     return bboxes, areas, torch.stack(masks, dim=0).to(device=cam.device)
 
 
@@ -478,6 +508,9 @@ def compute_multi_part_evidence(
         num_parts=3,
         use_accum_erase=True,
         top1_source='teacher_top1',
+        crop_mode='bbox',
+        window_ratio=0.35,
+        erase_mode='cam_mask',
         cam_quantile=0.8,
         min_area=0.05,
         max_area=0.7,
@@ -492,6 +525,9 @@ def compute_multi_part_evidence(
     # D1 只读诊断：CAM 输入使用逐轮擦除图，part crop 始终从原图裁剪，不向训练 loss 传递梯度。
     group_keys = _normalize_multi_part_groups(groups)
     num_parts = max(1, int(num_parts))
+    crop_mode = str(crop_mode).lower()
+    erase_mode = str(erase_mode).lower()
+    window_ratio = float(window_ratio)
     if len(group_keys) == 0:
         return [], []
 
@@ -526,28 +562,48 @@ def compute_multi_part_evidence(
             cam_input = images_float
             for part_idx in range(num_parts):
                 cam, _ = generate_cam(model, cam_input, cam_targets, cam_type=cam_type)
-                bboxes, bbox_areas, erase_masks = cam_to_bbox(
+                cam_bboxes, cam_bbox_areas, cam_masks = cam_to_bbox(
                     cam, images.shape[-2:], quantile=cam_quantile,
                     min_area=min_area, max_area=max_area, padding=bbox_padding
                 )
-                erase_masks = erase_masks.bool()
+                peak_bboxes, peak_bbox_areas, peak_masks = cam_to_peak_window(
+                    cam, images.shape[-2:], window_ratio=window_ratio
+                )
+                # D1-v2 支持固定 peak window，避免外接框吞掉整只鸟或多个高响应点。
+                if crop_mode == 'bbox':
+                    crop_bboxes, crop_bbox_areas = cam_bboxes, cam_bbox_areas
+                elif crop_mode == 'peak_window':
+                    crop_bboxes, crop_bbox_areas = peak_bboxes, peak_bbox_areas
+                else:
+                    raise ValueError(f'multi_part_crop_mode only supports bbox or peak_window, got {crop_mode}.')
+
+                if erase_mode == 'cam_mask':
+                    erase_masks = cam_masks.bool()
+                elif erase_mode == 'bbox':
+                    erase_masks = _bboxes_to_masks(image_h, image_w, cam_bboxes, images.device)
+                elif erase_mode == 'peak_window':
+                    erase_masks = peak_masks.bool()
+                else:
+                    raise ValueError(
+                        f'multi_part_erase_mode only supports cam_mask, bbox, or peak_window, got {erase_mode}.'
+                    )
                 erase_accum_mask = erase_accum_mask | erase_masks
-                x_part = crop_by_bbox(images_float, bboxes)
+                x_part = crop_by_bbox(images_float, crop_bboxes)
                 logits_part = _extract_logits(model(x_part))
                 probs_part = logits_part.detach().softmax(dim=1)
                 part_conf, part_pred = probs_part.max(dim=1)
                 p_part_target = probs_part.gather(1, cam_targets.view(-1, 1)).squeeze(1)
                 p_part_label = probs_part.gather(1, labels_long.view(-1, 1)).squeeze(1)
-                bbox_areas_tensor = torch.tensor(bbox_areas, device=images.device, dtype=images.dtype)
+                bbox_areas_tensor = torch.tensor(crop_bbox_areas, device=images.device, dtype=images.dtype)
                 valid_part = torch.isfinite(bbox_areas_tensor) & (bbox_areas_tensor > 0)
                 part_iou_prev, part_iou_max = _multi_part_iou_vectors(
-                    bboxes, previous_bboxes, images.device, images.dtype
+                    crop_bboxes, previous_bboxes, images.device, images.dtype
                 )
                 erase_accum_area = erase_accum_mask.float().mean(dim=(1, 2)).to(dtype=images.dtype)
 
                 part_records.append({
                     'part_id': part_idx + 1,
-                    'bboxes': bboxes,
+                    'bboxes': crop_bboxes,
                     'bbox_area': bbox_areas_tensor,
                     'part_pred': part_pred,
                     'part_conf': part_conf,
@@ -557,8 +613,11 @@ def compute_multi_part_evidence(
                     'part_iou_max': part_iou_max,
                     'erase_accum_area': erase_accum_area,
                     'valid_part': valid_part,
+                    'crop_mode': crop_mode,
+                    'erase_mode': erase_mode,
+                    'window_ratio': window_ratio,
                 })
-                previous_bboxes.append(bboxes)
+                previous_bboxes.append(crop_bboxes)
 
                 erase_mask_for_next_cam = erase_accum_mask if use_accum_erase else erase_masks
                 cam_input = erase_by_mask(images_float, erase_mask_for_next_cam, fill_value=0.0)
@@ -569,7 +628,8 @@ def compute_multi_part_evidence(
 
     batch_rows = build_multi_part_log_rows(
         epoch, batch_idx, part_records, idx_clean, idx_id,
-        group_keys=group_keys, num_parts=num_parts
+        group_keys=group_keys, num_parts=num_parts,
+        crop_mode=crop_mode, erase_mode=erase_mode, window_ratio=window_ratio
     )
     sample_rows = build_multi_part_sample_rows(
         epoch, batch_idx, part_records, labels, sample_indices,
@@ -1043,7 +1103,8 @@ def build_id_candidate_sample_rows(epoch, batch_idx, candidate_batch, sample_ind
 
 
 def build_multi_part_log_rows(epoch, batch_idx, part_records, idx_clean, idx_id,
-                              group_keys=None, num_parts=3):
+                              group_keys=None, num_parts=3,
+                              crop_mode='bbox', erase_mode='cam_mask', window_ratio=0.35):
     # D1 batch 日志按 group+part_id 展开，便于直接观察 part2/part3 是否退化或高度重叠。
     if group_keys is None:
         group_keys = ['clean', 'id']
@@ -1059,7 +1120,8 @@ def build_multi_part_log_rows(epoch, batch_idx, part_records, idx_clean, idx_id,
         for record in part_records:
             if num_selected == 0:
                 rows.append(_empty_multi_part_log_row(
-                    epoch, batch_idx, group_name, record['part_id'], num_selected, int(num_parts)
+                    epoch, batch_idx, group_name, record['part_id'], num_selected, int(num_parts),
+                    crop_mode, erase_mode, window_ratio
                 ))
                 continue
 
@@ -1068,7 +1130,8 @@ def build_multi_part_log_rows(epoch, batch_idx, part_records, idx_clean, idx_id,
             num_valid = int(selected_indices.numel())
             if num_valid == 0:
                 rows.append(_empty_multi_part_log_row(
-                    epoch, batch_idx, group_name, record['part_id'], num_selected, int(num_parts)
+                    epoch, batch_idx, group_name, record['part_id'], num_selected, int(num_parts),
+                    crop_mode, erase_mode, window_ratio
                 ))
                 continue
 
@@ -1088,6 +1151,9 @@ def build_multi_part_log_rows(epoch, batch_idx, part_records, idx_clean, idx_id,
                 'p_part_label_mean': _mean_or_zero(record['p_part_label'][selected_indices]),
                 'part_conf_mean': _mean_or_zero(record['part_conf'][selected_indices]),
                 'erase_accum_area_mean': _mean_or_zero(record['erase_accum_area'][selected_indices]),
+                'crop_mode': crop_mode,
+                'erase_mode': erase_mode,
+                'window_ratio': float(window_ratio),
             })
     return rows
 
@@ -1150,6 +1216,9 @@ def build_multi_part_sample_rows(epoch, batch_idx, part_records, labels, sample_
                 'part_rank_conf': int(part_rank_conf[part_idx, batch_pos].item()),
                 'valid_part': int(record['valid_part'][batch_pos].detach().item()),
                 'erase_round': int(record['part_id']),
+                'crop_mode': record['crop_mode'],
+                'erase_mode': record['erase_mode'],
+                'window_ratio': float(record['window_ratio']),
             })
     return rows
 
@@ -1262,7 +1331,8 @@ def _empty_id_candidate_log_row(epoch, batch_idx, num_selected, num_valid,
     }
 
 
-def _empty_multi_part_log_row(epoch, batch_idx, group, part_id, num_selected, num_parts):
+def _empty_multi_part_log_row(epoch, batch_idx, group, part_id, num_selected, num_parts,
+                              crop_mode='bbox', erase_mode='cam_mask', window_ratio=0.35):
     return {
         'epoch': int(epoch),
         'batch_idx': int(batch_idx),
@@ -1279,6 +1349,9 @@ def _empty_multi_part_log_row(epoch, batch_idx, group, part_id, num_selected, nu
         'p_part_label_mean': 0.0,
         'part_conf_mean': 0.0,
         'erase_accum_area_mean': 0.0,
+        'crop_mode': crop_mode,
+        'erase_mode': erase_mode,
+        'window_ratio': float(window_ratio),
     }
 
 
@@ -1831,6 +1904,17 @@ def _resize_bbox_around_center(cx, cy, width, height, image_h, image_w):
     ), image_h, image_w)
 
 
+def _fixed_size_bbox_around_center(cx, cy, width, height, image_h, image_w):
+    # D1 peak window 保持固定窗口大小；靠近边界时整体平移到图内，而不是压缩窗口。
+    width = max(1, min(int(width), image_w))
+    height = max(1, min(int(height), image_h))
+    left = int(round(cx - width / 2.0))
+    top = int(round(cy - height / 2.0))
+    left = max(0, min(left, image_w - width))
+    top = max(0, min(top, image_h - height))
+    return left, top, left + width, top + height
+
+
 def _shrink_bbox_to_max_area(bbox, image_h, image_w, max_area):
     x1, y1, x2, y2 = bbox
     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
@@ -1867,6 +1951,11 @@ def _bbox_mask(image_h, image_w, bbox, device):
     mask = torch.zeros((image_h, image_w), dtype=torch.bool, device=device)
     mask[y1:y2, x1:x2] = True
     return mask
+
+
+def _bboxes_to_masks(image_h, image_w, bboxes, device):
+    # D1-v2 bbox 擦除模式使用完整窗口/外接框，强制后续 CAM 避开已选区域。
+    return torch.stack([_bbox_mask(image_h, image_w, bbox, device) for bbox in bboxes], dim=0)
 
 
 def _extract_logits(output):
