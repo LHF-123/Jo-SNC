@@ -8,12 +8,13 @@ crop_size: 448
 # network & optimization
 arch: resnet50
 opt: sgd
-batch_size: 32
+# Aircraft C1 在 32G 显存上提升 batch，并按 bs32/lr0.005 线性缩放学习率。
+batch_size: 48
 epochs: 120
-lr: 0.005
+lr: 0.0075
 lr_decay: cosine:10,1e-8,110
 warmup_epochs: 5
-warmup_lr: 0.005
+warmup_lr: 0.0075
 warmup_lr_plan: constant
 weight_decay: 3.0e-4
 use_fp16: true
@@ -78,4 +79,4 @@ d2_diag: false
 # logging
 log_root: ./results/
 log_proj: benchmark_webfg
-log_name: resnet50-web-aircraft-C1
+log_name: resnet50-web-aircraft-C1-bs48
