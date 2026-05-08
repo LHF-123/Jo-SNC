@@ -71,6 +71,26 @@ MULTI_PART_SAMPLE_CSV_HEADER = (
     'part_rank_conf,valid_part,erase_round,crop_mode,erase_mode,window_ratio'
 )
 
+D2_DIAG_CSV_HEADER = (
+    'epoch,batch_idx,lambda,num_clean,num_c1_gated,num_part_valid_samples,'
+    'valid_sample_ratio,valid_part_per_sample,part1_valid_ratio,part2_valid_ratio,part3_valid_ratio,'
+    'global_acc_all_c1_gated,global_acc_valid_subset,top1_final_acc,weighted_final_acc,'
+    'top1_acc_delta,weighted_acc_delta,changed_correct_top1,changed_wrong_top1,'
+    'changed_correct_weighted,changed_wrong_weighted,valid_p_part_target_mean,'
+    'filtered_p_part_target_mean,valid_quality_score_mean,filtered_quality_score_mean,'
+    'valid_marginal_drop_mean,filtered_marginal_drop_mean,global_logit_norm_mean,'
+    'part_logit_norm_mean'
+)
+
+D2_DIAG_SAMPLE_CSV_HEADER = (
+    'epoch,batch_idx,lambda,sample_id,label,global_pred,global_conf,'
+    'global_correct_valid_subset,selected_parts_top1,selected_parts_weighted,'
+    'part_quality_scores,part_valid_mask,part_p_targets,part_marginal_drops,part_iou_max,'
+    'best_part_idx,best_part_quality_score,top1_final_pred,top1_final_conf,'
+    'top1_final_correct,weighted_final_pred,weighted_final_conf,weighted_final_correct,'
+    'top1_changed,weighted_changed'
+)
+
 
 def format_local_evidence_row(row):
     return (
@@ -186,6 +206,44 @@ def format_multi_part_sample_row(row):
         f"{row['part_iou_max']:.6f},{row['erase_accum_area']:.6f},"
         f"{row['part_rank_conf']},{row['valid_part']},{row['erase_round']},"
         f"{row['crop_mode']},{row['erase_mode']},{row['window_ratio']:.6f}"
+    )
+
+
+def format_d2_diag_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['lambda']:.6f},"
+        f"{row['num_clean']},{row['num_c1_gated']},{row['num_part_valid_samples']},"
+        f"{row['valid_sample_ratio']:.6f},{row['valid_part_per_sample']:.6f},"
+        f"{row['part1_valid_ratio']:.6f},{row['part2_valid_ratio']:.6f},"
+        f"{row['part3_valid_ratio']:.6f},{row['global_acc_all_c1_gated']:.6f},"
+        f"{row['global_acc_valid_subset']:.6f},{row['top1_final_acc']:.6f},"
+        f"{row['weighted_final_acc']:.6f},{row['top1_acc_delta']:.6f},"
+        f"{row['weighted_acc_delta']:.6f},{row['changed_correct_top1']},"
+        f"{row['changed_wrong_top1']},{row['changed_correct_weighted']},"
+        f"{row['changed_wrong_weighted']},{row['valid_p_part_target_mean']:.6f},"
+        f"{row['filtered_p_part_target_mean']:.6f},"
+        f"{row['valid_quality_score_mean']:.6f},"
+        f"{row['filtered_quality_score_mean']:.6f},"
+        f"{row['valid_marginal_drop_mean']:.6f},"
+        f"{row['filtered_marginal_drop_mean']:.6f},"
+        f"{row['global_logit_norm_mean']:.6f},{row['part_logit_norm_mean']:.6f}"
+    )
+
+
+def format_d2_diag_sample_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['lambda']:.6f},"
+        f"{row['sample_id']},{row['label']},{row['global_pred']},"
+        f"{row['global_conf']:.6f},{row['global_correct_valid_subset']},"
+        f"{row['selected_parts_top1']},{row['selected_parts_weighted']},"
+        f"{row['part_quality_scores']},{row['part_valid_mask']},"
+        f"{row['part_p_targets']},{row['part_marginal_drops']},"
+        f"{row['part_iou_max']},{row['best_part_idx']},"
+        f"{row['best_part_quality_score']:.6f},{row['top1_final_pred']},"
+        f"{row['top1_final_conf']:.6f},{row['top1_final_correct']},"
+        f"{row['weighted_final_pred']},{row['weighted_final_conf']:.6f},"
+        f"{row['weighted_final_correct']},{row['top1_changed']},"
+        f"{row['weighted_changed']}"
     )
 
 
@@ -642,6 +700,211 @@ def compute_multi_part_evidence(
             max_samples=image_max_samples,
             samples_per_class=image_samples_per_class,
         )
+    return batch_rows, sample_rows
+
+
+def compute_d2_diag(
+        quality_model,
+        student_model,
+        images,
+        labels,
+        sample_indices,
+        idx_clean,
+        c1_gate_mask,
+        epoch,
+        batch_idx,
+        lambdas=(0.1,),
+        aggregation_modes=('top1_valid', 'weighted_valid'),
+        num_parts=3,
+        use_accum_erase=True,
+        crop_mode='peak_window',
+        window_ratio=0.35,
+        erase_mode='peak_window',
+        quality_metric='p_target_x_marginal_drop',
+        quality_gate_type='per_part_percentile',
+        quality_keep_ratio=0.5,
+        iou_filter=True,
+        iou_thr=0.5,
+        cam_quantile=0.8,
+        min_area=0.05,
+        max_area=0.7,
+        bbox_padding=0.05,
+        cam_type='weightcam'):
+    # D2_diag 只读：teacher/EMA 负责质量评分，student 负责 global/part logits 聚合诊断。
+    if str(quality_metric).lower() != 'p_target_x_marginal_drop':
+        raise ValueError(f'D2_diag only supports p_target_x_marginal_drop, got {quality_metric}.')
+    if str(quality_gate_type).lower() != 'per_part_percentile':
+        raise ValueError(f'D2_diag only supports per_part_percentile, got {quality_gate_type}.')
+
+    lambdas = [float(value) for value in lambdas]
+    aggregation_modes = [str(value).lower() for value in aggregation_modes]
+    use_top1 = 'top1_valid' in aggregation_modes
+    use_weighted = 'weighted_valid' in aggregation_modes
+    num_parts = max(1, int(num_parts))
+    crop_mode = str(crop_mode).lower()
+    erase_mode = str(erase_mode).lower()
+    window_ratio = float(window_ratio)
+    quality_keep_ratio = float(quality_keep_ratio)
+    iou_thr = float(iou_thr)
+
+    idx_clean = idx_clean.detach().long()
+    c1_gate_mask = c1_gate_mask.detach().to(device=images.device, dtype=torch.bool)
+    clean_mask = torch.zeros(images.size(0), device=images.device, dtype=torch.bool)
+    clean_mask[idx_clean] = True
+    c1_clean_mask = clean_mask & c1_gate_mask
+    num_clean = int(idx_clean.numel())
+    num_c1_gated = int(c1_clean_mask.sum().item())
+    c1_gated_indices = torch.nonzero(c1_clean_mask, as_tuple=False).flatten()
+    if num_c1_gated == 0:
+        # D2_diag 没有 C1-gated clean 样本时直接写零行，避免整 batch 额外 CAM/ResNet 前向。
+        return (
+            [
+                _empty_d2_diag_row(epoch, batch_idx, lambda_value, num_clean, num_c1_gated)
+                for lambda_value in lambdas
+            ],
+            []
+        )
+
+    # D2_diag 的 eligible 子集从 C1-gated clean 开始，后续 CAM/part logits 只在该子 batch 上计算。
+    diag_images = images.index_select(0, c1_gated_indices)
+    diag_labels = labels.index_select(0, c1_gated_indices)
+    if torch.is_tensor(sample_indices):
+        diag_sample_indices = sample_indices.detach().cpu().long()[c1_gated_indices.detach().cpu().long()]
+    else:
+        all_sample_indices = torch.tensor(sample_indices, dtype=torch.long)
+        diag_sample_indices = all_sample_indices[c1_gated_indices.detach().cpu().long()]
+    diag_c1_clean_mask = torch.ones(num_c1_gated, device=images.device, dtype=torch.bool)
+
+    quality_was_training = quality_model.training
+    student_was_training = student_model.training
+    quality_model.eval()
+    student_model.eval()
+    try:
+        with torch.no_grad(), _autocast_disabled(diag_images):
+            images_float = diag_images.float()
+            image_h, image_w = diag_images.shape[-2:]
+            labels_long = diag_labels.long()
+            previous_bboxes = []
+            part_records = []
+            student_part_logits = []
+            erase_accum_mask = torch.zeros(
+                diag_images.size(0), image_h, image_w, device=diag_images.device, dtype=torch.bool
+            )
+            cam_input = images_float
+            for part_idx in range(num_parts):
+                cam, logits_before = generate_cam(quality_model, cam_input, labels_long, cam_type=cam_type)
+                probs_before = logits_before.detach().softmax(dim=1)
+                p_before = probs_before.gather(1, labels_long.view(-1, 1)).squeeze(1)
+
+                cam_bboxes, cam_bbox_areas, cam_masks = cam_to_bbox(
+                    cam, diag_images.shape[-2:], quantile=cam_quantile,
+                    min_area=min_area, max_area=max_area, padding=bbox_padding
+                )
+                peak_bboxes, peak_bbox_areas, peak_masks = cam_to_peak_window(
+                    cam, diag_images.shape[-2:], window_ratio=window_ratio
+                )
+                if crop_mode == 'bbox':
+                    crop_bboxes, crop_bbox_areas = cam_bboxes, cam_bbox_areas
+                elif crop_mode == 'peak_window':
+                    crop_bboxes, crop_bbox_areas = peak_bboxes, peak_bbox_areas
+                else:
+                    raise ValueError(f'multi_part_crop_mode only supports bbox or peak_window, got {crop_mode}.')
+
+                if erase_mode == 'cam_mask':
+                    erase_masks = cam_masks.bool()
+                elif erase_mode == 'bbox':
+                    erase_masks = _bboxes_to_masks(image_h, image_w, cam_bboxes, diag_images.device)
+                elif erase_mode == 'peak_window':
+                    erase_masks = peak_masks.bool()
+                else:
+                    raise ValueError(
+                        f'multi_part_erase_mode only supports cam_mask, bbox, or peak_window, got {erase_mode}.'
+                    )
+
+                next_erase_accum_mask = erase_accum_mask | erase_masks
+                x_part = crop_by_bbox(images_float, crop_bboxes)
+                quality_logits_part = _extract_logits(quality_model(x_part))
+                quality_probs_part = quality_logits_part.detach().softmax(dim=1)
+                p_part_target = quality_probs_part.gather(1, labels_long.view(-1, 1)).squeeze(1)
+                part_conf, _ = quality_probs_part.max(dim=1)
+                cam_after = erase_by_mask(images_float, next_erase_accum_mask, fill_value=0.0)
+                logits_after = _extract_logits(quality_model(cam_after))
+                p_after = logits_after.detach().softmax(dim=1).gather(1, labels_long.view(-1, 1)).squeeze(1)
+                marginal_drop = (p_before - p_after).clamp(min=0)
+                quality_score = p_part_target * marginal_drop
+                bbox_areas_tensor = torch.tensor(crop_bbox_areas, device=diag_images.device, dtype=diag_images.dtype)
+                valid_part = torch.isfinite(bbox_areas_tensor) & (bbox_areas_tensor > 0)
+                part_iou_prev, part_iou_max = _multi_part_iou_vectors(
+                    crop_bboxes, previous_bboxes, diag_images.device, diag_images.dtype
+                )
+
+                part_records.append({
+                    'part_id': part_idx + 1,
+                    'bboxes': crop_bboxes,
+                    'bbox_area': bbox_areas_tensor,
+                    'p_part_target': p_part_target,
+                    'part_conf': part_conf,
+                    'marginal_drop': marginal_drop,
+                    'quality_score': quality_score,
+                    'part_iou_max': part_iou_max,
+                    'valid_part': valid_part,
+                })
+                student_part_logits.append(_extract_logits(student_model(x_part)).detach())
+                previous_bboxes.append(crop_bboxes)
+                erase_accum_mask = next_erase_accum_mask
+                erase_mask_for_next_cam = erase_accum_mask if use_accum_erase else erase_masks
+                cam_input = erase_by_mask(images_float, erase_mask_for_next_cam, fill_value=0.0)
+
+            student_global_logits = _extract_logits(student_model(images_float)).detach()
+    finally:
+        if quality_was_training:
+            quality_model.train()
+        if student_was_training:
+            student_model.train()
+
+    part_quality = torch.stack([record['quality_score'].detach() for record in part_records], dim=1)
+    part_p_target = torch.stack([record['p_part_target'].detach() for record in part_records], dim=1)
+    part_marginal_drop = torch.stack([record['marginal_drop'].detach() for record in part_records], dim=1)
+    part_iou_max = torch.stack([record['part_iou_max'].detach() for record in part_records], dim=1)
+    part_valid_base = torch.stack([record['valid_part'].detach() for record in part_records], dim=1).bool()
+    part_logits = torch.stack(student_part_logits, dim=1)
+
+    quality_gate = _build_per_part_percentile_gate(
+        part_quality, diag_c1_clean_mask[:, None] & part_valid_base, keep_ratio=quality_keep_ratio
+    )
+    iou_gate = part_iou_max <= iou_thr if iou_filter else torch.ones_like(part_valid_base, dtype=torch.bool)
+    valid_part_mask = part_valid_base & quality_gate & iou_gate & diag_c1_clean_mask[:, None]
+    has_valid_part = valid_part_mask.any(dim=1)
+    eligible_mask = diag_c1_clean_mask & has_valid_part
+    num_eligible = int(eligible_mask.sum().item())
+
+    diag_context = {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'sample_indices': diag_sample_indices,
+        'labels': labels_long,
+        'num_clean': num_clean,
+        'num_c1_gated': num_c1_gated,
+        'num_eligible': num_eligible,
+        'c1_clean_mask': diag_c1_clean_mask,
+        'eligible_mask': eligible_mask,
+        'student_global_logits': student_global_logits,
+        'part_logits': part_logits,
+        'part_quality': part_quality,
+        'part_p_target': part_p_target,
+        'part_marginal_drop': part_marginal_drop,
+        'part_iou_max': part_iou_max,
+        'valid_part_mask': valid_part_mask,
+        'use_top1': use_top1,
+        'use_weighted': use_weighted,
+    }
+    batch_rows = [
+        _build_d2_diag_row(diag_context, lambda_value)
+        for lambda_value in lambdas
+    ]
+    sample_rows = []
+    for lambda_value in lambdas:
+        sample_rows.extend(_build_d2_diag_sample_rows(diag_context, lambda_value))
     return batch_rows, sample_rows
 
 
@@ -1254,6 +1517,202 @@ def save_multi_part_images(output_dir, sample_rows, images, x_erase_accum,
         grid.save(os.path.join(output_dir, filename))
 
 
+def _empty_d2_diag_row(epoch, batch_idx, lambda_value, num_clean, num_c1_gated):
+    # D2_diag 空子集日志保留 batch/lambda/count 字段，其余指标置零，便于 pandas 直接读取。
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'lambda': float(lambda_value),
+        'num_clean': int(num_clean),
+        'num_c1_gated': int(num_c1_gated),
+        'num_part_valid_samples': 0,
+        'valid_sample_ratio': 0.0,
+        'valid_part_per_sample': 0.0,
+        'part1_valid_ratio': 0.0,
+        'part2_valid_ratio': 0.0,
+        'part3_valid_ratio': 0.0,
+        'global_acc_all_c1_gated': 0.0,
+        'global_acc_valid_subset': 0.0,
+        'top1_final_acc': 0.0,
+        'weighted_final_acc': 0.0,
+        'top1_acc_delta': 0.0,
+        'weighted_acc_delta': 0.0,
+        'changed_correct_top1': 0,
+        'changed_wrong_top1': 0,
+        'changed_correct_weighted': 0,
+        'changed_wrong_weighted': 0,
+        'valid_p_part_target_mean': 0.0,
+        'filtered_p_part_target_mean': 0.0,
+        'valid_quality_score_mean': 0.0,
+        'filtered_quality_score_mean': 0.0,
+        'valid_marginal_drop_mean': 0.0,
+        'filtered_marginal_drop_mean': 0.0,
+        'global_logit_norm_mean': 0.0,
+        'part_logit_norm_mean': 0.0,
+    }
+
+
+def _build_d2_diag_row(context, lambda_value):
+    # D2_diag batch 指标只在 eligible 子集上比较 global 与聚合 logits，避免不同样本集合造成误判。
+    labels = context['labels']
+    c1_clean_mask = context['c1_clean_mask']
+    eligible_mask = context['eligible_mask']
+    valid_part_mask = context['valid_part_mask']
+    candidate_part_mask = c1_clean_mask[:, None]
+    part_quality = context['part_quality']
+    part_p_target = context['part_p_target']
+    part_marginal_drop = context['part_marginal_drop']
+    global_logits = context['student_global_logits']
+    part_logits = context['part_logits']
+    lambda_value = float(lambda_value)
+
+    global_probs = global_logits.softmax(dim=1)
+    global_conf, global_pred = global_probs.max(dim=1)
+    global_correct = global_pred.eq(labels)
+    global_acc_all_c1_gated = _masked_mean_bool(global_correct, c1_clean_mask)
+    global_acc_valid_subset = _masked_mean_bool(global_correct, eligible_mask)
+
+    final = _d2_diag_final_predictions(context, lambda_value)
+    top1_correct = final['top1_pred'].eq(labels)
+    weighted_correct = final['weighted_pred'].eq(labels)
+    top1_final_acc = _masked_mean_bool(top1_correct, eligible_mask) if context['use_top1'] else 0.0
+    weighted_final_acc = _masked_mean_bool(weighted_correct, eligible_mask) if context['use_weighted'] else 0.0
+
+    valid_part_counts = valid_part_mask.sum(dim=1).float()
+    num_c1_gated = context['num_c1_gated']
+    valid_values_mask = valid_part_mask
+    filtered_values_mask = candidate_part_mask & valid_part_mask.logical_not()
+    part_logit_norm = part_logits.detach().float().norm(dim=2)
+
+    return {
+        'epoch': context['epoch'],
+        'batch_idx': context['batch_idx'],
+        'lambda': lambda_value,
+        'num_clean': context['num_clean'],
+        'num_c1_gated': num_c1_gated,
+        'num_part_valid_samples': context['num_eligible'],
+        'valid_sample_ratio': context['num_eligible'] / max(num_c1_gated, 1),
+        'valid_part_per_sample': _mean_or_zero(valid_part_counts[eligible_mask]),
+        'part1_valid_ratio': _part_valid_ratio(valid_part_mask, 0, num_c1_gated),
+        'part2_valid_ratio': _part_valid_ratio(valid_part_mask, 1, num_c1_gated),
+        'part3_valid_ratio': _part_valid_ratio(valid_part_mask, 2, num_c1_gated),
+        'global_acc_all_c1_gated': global_acc_all_c1_gated,
+        'global_acc_valid_subset': global_acc_valid_subset,
+        'top1_final_acc': top1_final_acc,
+        'weighted_final_acc': weighted_final_acc,
+        'top1_acc_delta': top1_final_acc - global_acc_valid_subset if context['use_top1'] else 0.0,
+        'weighted_acc_delta': weighted_final_acc - global_acc_valid_subset if context['use_weighted'] else 0.0,
+        'changed_correct_top1': _changed_correct_count(global_correct, top1_correct, eligible_mask) if context['use_top1'] else 0,
+        'changed_wrong_top1': _changed_wrong_count(global_correct, top1_correct, eligible_mask) if context['use_top1'] else 0,
+        'changed_correct_weighted': _changed_correct_count(global_correct, weighted_correct, eligible_mask) if context['use_weighted'] else 0,
+        'changed_wrong_weighted': _changed_wrong_count(global_correct, weighted_correct, eligible_mask) if context['use_weighted'] else 0,
+        'valid_p_part_target_mean': _mean_or_zero(part_p_target[valid_values_mask]),
+        'filtered_p_part_target_mean': _mean_or_zero(part_p_target[filtered_values_mask]),
+        'valid_quality_score_mean': _mean_or_zero(part_quality[valid_values_mask]),
+        'filtered_quality_score_mean': _mean_or_zero(part_quality[filtered_values_mask]),
+        'valid_marginal_drop_mean': _mean_or_zero(part_marginal_drop[valid_values_mask]),
+        'filtered_marginal_drop_mean': _mean_or_zero(part_marginal_drop[filtered_values_mask]),
+        'global_logit_norm_mean': _mean_or_zero(global_logits.detach().float().norm(dim=1)[eligible_mask]),
+        'part_logit_norm_mean': _mean_or_zero(part_logit_norm[valid_part_mask]),
+    }
+
+
+def _build_d2_diag_sample_rows(context, lambda_value):
+    # D2_diag 样本日志只写 eligible 子集，便于直接复算 changed_correct / changed_wrong。
+    eligible_indices = torch.nonzero(context['eligible_mask'], as_tuple=False).flatten()
+    if eligible_indices.numel() == 0:
+        return []
+
+    labels = context['labels']
+    sample_indices = context['sample_indices']
+    if torch.is_tensor(sample_indices):
+        sample_ids = sample_indices.detach().cpu().long()
+    else:
+        sample_ids = torch.tensor(sample_indices, dtype=torch.long)
+
+    global_logits = context['student_global_logits']
+    global_probs = global_logits.softmax(dim=1)
+    global_conf, global_pred = global_probs.max(dim=1)
+    global_correct = global_pred.eq(labels)
+    final = _d2_diag_final_predictions(context, lambda_value)
+    top1_probs = final['top1_logits'].softmax(dim=1)
+    top1_conf, top1_pred = top1_probs.max(dim=1)
+    weighted_probs = final['weighted_logits'].softmax(dim=1)
+    weighted_conf, weighted_pred = weighted_probs.max(dim=1)
+    top1_correct = top1_pred.eq(labels)
+    weighted_correct = weighted_pred.eq(labels)
+
+    rows = []
+    part_quality = context['part_quality'].detach().cpu()
+    part_valid_mask = context['valid_part_mask'].detach().cpu()
+    part_p_target = context['part_p_target'].detach().cpu()
+    part_marginal_drop = context['part_marginal_drop'].detach().cpu()
+    part_iou_max = context['part_iou_max'].detach().cpu()
+    best_part_idx = final['best_part_idx'].detach().cpu().long()
+    best_part_quality = final['best_part_quality'].detach().cpu()
+    for batch_pos in eligible_indices.detach().cpu().long().tolist():
+        valid_parts = [
+            str(part_idx + 1)
+            for part_idx, is_valid in enumerate(part_valid_mask[batch_pos].tolist())
+            if bool(is_valid)
+        ]
+        best_part = int(best_part_idx[batch_pos].item()) + 1
+        rows.append({
+            'epoch': context['epoch'],
+            'batch_idx': context['batch_idx'],
+            'lambda': float(lambda_value),
+            'sample_id': int(sample_ids[batch_pos].item()),
+            'label': int(labels.detach().cpu()[batch_pos].item()),
+            'global_pred': int(global_pred.detach().cpu()[batch_pos].item()),
+            'global_conf': float(global_conf.detach().cpu()[batch_pos].item()),
+            'global_correct_valid_subset': int(global_correct.detach().cpu()[batch_pos].item()),
+            'selected_parts_top1': str(best_part),
+            'selected_parts_weighted': '|'.join(valid_parts),
+            'part_quality_scores': _pipe_float_values(part_quality[batch_pos]),
+            'part_valid_mask': _pipe_int_values(part_valid_mask[batch_pos].long()),
+            'part_p_targets': _pipe_float_values(part_p_target[batch_pos]),
+            'part_marginal_drops': _pipe_float_values(part_marginal_drop[batch_pos]),
+            'part_iou_max': _pipe_float_values(part_iou_max[batch_pos]),
+            'best_part_idx': best_part,
+            'best_part_quality_score': float(best_part_quality[batch_pos].item()),
+            'top1_final_pred': int(top1_pred.detach().cpu()[batch_pos].item()) if context['use_top1'] else -1,
+            'top1_final_conf': float(top1_conf.detach().cpu()[batch_pos].item()) if context['use_top1'] else 0.0,
+            'top1_final_correct': int(top1_correct.detach().cpu()[batch_pos].item()) if context['use_top1'] else 0,
+            'weighted_final_pred': int(weighted_pred.detach().cpu()[batch_pos].item()) if context['use_weighted'] else -1,
+            'weighted_final_conf': float(weighted_conf.detach().cpu()[batch_pos].item()) if context['use_weighted'] else 0.0,
+            'weighted_final_correct': int(weighted_correct.detach().cpu()[batch_pos].item()) if context['use_weighted'] else 0,
+            'top1_changed': int(top1_pred.detach().cpu()[batch_pos].item() != global_pred.detach().cpu()[batch_pos].item()) if context['use_top1'] else 0,
+            'weighted_changed': int(weighted_pred.detach().cpu()[batch_pos].item() != global_pred.detach().cpu()[batch_pos].item()) if context['use_weighted'] else 0,
+        })
+    return rows
+
+
+def _d2_diag_final_predictions(context, lambda_value):
+    valid_part_mask = context['valid_part_mask']
+    part_quality = context['part_quality'].clamp(min=0)
+    part_logits = context['part_logits']
+    global_logits = context['student_global_logits']
+    masked_quality = part_quality.masked_fill(~valid_part_mask, torch.finfo(part_quality.dtype).min)
+    best_part_idx = masked_quality.argmax(dim=1)
+    best_part_quality = part_quality.gather(1, best_part_idx.view(-1, 1)).squeeze(1)
+    batch_indices = torch.arange(global_logits.size(0), device=global_logits.device)
+    best_part_logits = part_logits[batch_indices, best_part_idx]
+    top1_logits = global_logits + float(lambda_value) * best_part_logits
+
+    weights = part_quality * valid_part_mask.to(dtype=part_quality.dtype)
+    weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-12)
+    weighted_part_logits = (part_logits * weights[:, :, None]).sum(dim=1)
+    weighted_logits = global_logits + float(lambda_value) * weighted_part_logits
+    return {
+        'best_part_idx': best_part_idx,
+        'best_part_quality': best_part_quality,
+        'top1_logits': top1_logits,
+        'top1_pred': top1_logits.argmax(dim=1),
+        'weighted_logits': weighted_logits,
+        'weighted_pred': weighted_logits.argmax(dim=1),
+    }
+
+
 def _part_ce_loss_values(josnc_loss, part_ce_loss, part_ce_weight):
     josnc_loss_value = float(josnc_loss.detach().item())
     part_ce_loss_value = float(part_ce_loss.detach().item())
@@ -1381,6 +1840,66 @@ def _float_value(value):
     if torch.is_tensor(value):
         return float(value.detach().item())
     return float(value)
+
+
+def _build_per_part_percentile_gate(scores, base_mask, keep_ratio=0.5):
+    # D2_diag 每个 part 独立做 percentile top-k，避免 part1 分数天然压制 part2/part3。
+    scores = scores.detach()
+    base_mask = base_mask.to(device=scores.device, dtype=torch.bool)
+    gate_mask = torch.zeros_like(base_mask, dtype=torch.bool)
+    keep_ratio = max(0.0, min(float(keep_ratio), 1.0))
+    if scores.numel() == 0 or keep_ratio <= 0.0:
+        return gate_mask
+
+    for part_idx in range(scores.size(1)):
+        candidate_indices = torch.nonzero(base_mask[:, part_idx], as_tuple=False).flatten()
+        if candidate_indices.numel() == 0:
+            continue
+        k = max(1, int(candidate_indices.numel() * keep_ratio))
+        k = min(k, candidate_indices.numel())
+        part_scores = scores[candidate_indices, part_idx]
+        _, topk_indices = torch.topk(part_scores, k, largest=True, sorted=False)
+        gate_mask[candidate_indices[topk_indices], part_idx] = True
+    return gate_mask
+
+
+def _masked_mean_bool(values, mask):
+    # D2_diag accuracy 只在指定子集上统计；空子集返回 0，避免日志出现 NaN。
+    values = values.detach().to(dtype=torch.float)
+    mask = mask.to(device=values.device, dtype=torch.bool)
+    if mask.sum().item() == 0:
+        return 0.0
+    return float(values[mask].mean().item())
+
+
+def _part_valid_ratio(valid_part_mask, part_idx, denominator):
+    if part_idx >= valid_part_mask.size(1) or denominator <= 0:
+        return 0.0
+    return float(valid_part_mask[:, part_idx].sum().item() / max(int(denominator), 1))
+
+
+def _changed_correct_count(global_correct, final_correct, eligible_mask):
+    # 聚合后从错变对的样本数，用于判断 part logits 是否提供正收益。
+    mask = eligible_mask.to(device=global_correct.device, dtype=torch.bool)
+    changed = mask & global_correct.logical_not() & final_correct
+    return int(changed.sum().item())
+
+
+def _changed_wrong_count(global_correct, final_correct, eligible_mask):
+    # 聚合后从对变错的样本数，用于约束 D2_safe 是否可能扰动主干预测。
+    mask = eligible_mask.to(device=global_correct.device, dtype=torch.bool)
+    changed = mask & global_correct & final_correct.logical_not()
+    return int(changed.sum().item())
+
+
+def _pipe_float_values(values):
+    values = values.detach().flatten().cpu().tolist()
+    return '|'.join(f'{float(value):.6f}' for value in values)
+
+
+def _pipe_int_values(values):
+    values = values.detach().flatten().cpu().tolist()
+    return '|'.join(str(int(value)) for value in values)
 
 
 def _normalize_multi_part_groups(groups):

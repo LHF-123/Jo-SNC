@@ -102,7 +102,30 @@ multi_part_save_images: true
 multi_part_image_max_samples: 32
 multi_part_image_samples_per_class: 1
 
+# D2_diag：只做 global logits 与过滤后 part logits 的即时诊断，不加 loss。
+d2_diag: true
+d2_diag_log: true
+d2_diag_groups: clean
+d2_diag_require_c1_gate: true
+d2_diag_start_epoch: 46
+d2_diag_every: 1
+d2_diag_max_batches: 0
+d2_diag_aggregation:
+  - top1_valid
+  - weighted_valid
+d2_diag_weights:
+  - 0.05
+  - 0.1
+  - 0.2
+d2_diag_use_teacher_for_quality: true
+d2_diag_use_student_for_logits: true
+multi_part_quality_metric: p_target_x_marginal_drop
+multi_part_quality_gate_type: per_part_percentile
+multi_part_quality_keep_ratio: 0.5
+multi_part_iou_filter: true
+multi_part_iou_thr: 0.5
+
 # logging
 log_root: ./results/
 log_proj: ''
-log_name: D1_C1_multi_part
+log_name: D2_diag_C1_multi_part

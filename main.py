@@ -35,6 +35,8 @@ from utils.eval import accuracy, evaluate, detection_evaluate
 from utils.utils import *
 from utils.loss import *
 from utils.local_evidence import (
+    D2_DIAG_CSV_HEADER,
+    D2_DIAG_SAMPLE_CSV_HEADER,
     ID_CANDIDATE_CSV_HEADER,
     ID_CANDIDATE_SAMPLE_CSV_HEADER,
     LOCAL_EVIDENCE_CSV_HEADER,
@@ -52,8 +54,11 @@ from utils.local_evidence import (
     build_part_ce_log_row,
     compute_id_candidate_effective_weight,
     compute_id_candidate_loss,
+    compute_d2_diag,
     compute_local_evidence,
     compute_multi_part_evidence,
+    format_d2_diag_row,
+    format_d2_diag_sample_row,
     format_id_candidate_row,
     format_id_candidate_sample_row,
     format_local_evidence_row,
@@ -273,6 +278,21 @@ def _should_run_multi_part(cfg, epoch, batch_idx):
     return True
 
 
+def _should_run_d2_diag(cfg, epoch, batch_idx):
+    # D2_diag 只写诊断 CSV，不加 loss；按 start/every/max_batches 控制额外 CAM 开销。
+    if not cfg.d2_diag or not cfg.d2_diag_log:
+        return False
+    if (epoch + 1) < cfg.d2_diag_start_epoch:
+        return False
+    if cfg.d2_diag_every <= 0:
+        return False
+    if ((epoch + 1 - cfg.d2_diag_start_epoch) % cfg.d2_diag_every) != 0:
+        return False
+    if cfg.d2_diag_max_batches > 0 and batch_idx >= cfg.d2_diag_max_batches:
+        return False
+    return True
+
+
 def generate_label_sets(batch_label_sets, nc):
     bs = batch_label_sets.size(0)
     label_sets = torch.zeros(bs, nc).to(batch_label_sets.device)
@@ -425,6 +445,38 @@ def main(gpu, cfg):
     invalid_multi_part_groups = [item for item in multi_part_groups if item not in ['clean', 'id']]
     if invalid_multi_part_groups:
         raise ValueError(f'multi_part_groups only supports clean,id, got {invalid_multi_part_groups}.')
+    if cfg.d2_diag:
+        # D2_diag 第一版固定在 clean ∩ C1 gate ∩ valid part 子集上比较，不启用训练 loss。
+        if not (cfg.part_ce and cfg.part_ce_gate and cfg.d2_diag_require_c1_gate):
+            raise ValueError('D2_diag requires part_ce=true, part_ce_gate=true, and d2_diag_require_c1_gate=true.')
+        if cfg.d2_diag_groups != 'clean':
+            raise ValueError(f'D2_diag currently supports d2_diag_groups=clean only, got {cfg.d2_diag_groups}.')
+        if cfg.d2_diag_start_epoch < 0 or cfg.d2_diag_every < 0 or cfg.d2_diag_max_batches < 0:
+            raise ValueError('d2_diag_start_epoch/every/max_batches should be non-negative.')
+        if not cfg.d2_diag_use_teacher_for_quality or not cfg.d2_diag_use_student_for_logits:
+            raise ValueError('D2_diag v1 requires teacher quality scoring and student logits aggregation.')
+        invalid_d2_aggs = [
+            item for item in cfg.d2_diag_aggregation
+            if item not in ['top1_valid', 'weighted_valid']
+        ]
+        if invalid_d2_aggs or len(cfg.d2_diag_aggregation) == 0:
+            raise ValueError(f'd2_diag_aggregation supports top1_valid,weighted_valid, got {cfg.d2_diag_aggregation}.')
+        if len(cfg.d2_diag_weights) == 0 or any(weight < 0 for weight in cfg.d2_diag_weights):
+            raise ValueError(f'd2_diag_weights should be non-negative and non-empty, got {cfg.d2_diag_weights}.')
+        if cfg.multi_part_quality_metric != 'p_target_x_marginal_drop':
+            raise ValueError(
+                f'multi_part_quality_metric should be p_target_x_marginal_drop, got {cfg.multi_part_quality_metric}.'
+            )
+        if cfg.multi_part_quality_gate_type != 'per_part_percentile':
+            raise ValueError(
+                f'multi_part_quality_gate_type should be per_part_percentile, got {cfg.multi_part_quality_gate_type}.'
+            )
+        if not (0.0 <= cfg.multi_part_quality_keep_ratio <= 1.0):
+            raise ValueError(
+                f'multi_part_quality_keep_ratio should be within [0, 1], got {cfg.multi_part_quality_keep_ratio}.'
+            )
+        if not (0.0 <= cfg.multi_part_iou_thr <= 1.0):
+            raise ValueError(f'multi_part_iou_thr should be within [0, 1], got {cfg.multi_part_iou_thr}.')
     part_ce_writer = None
     part_ce_gate_sample_writer = None
     if cfg.part_ce and cfg.part_ce_log:
@@ -470,6 +522,16 @@ def main(gpu, cfg):
         # D1 图片导出不依赖 CSV 开关，便于只看图不写样本级日志。
         multi_part_image_dir = os.path.join(result_dir, 'multi_part_images')
         multi_part_norm = get_dataset_normalization(cfg.dataset)
+    d2_diag_writer = None
+    d2_diag_sample_writer = None
+    if cfg.d2_diag and cfg.d2_diag_log:
+        # D2_diag 单独写 global vs part-logits 聚合诊断，不参与 optimizer 和训练 loss。
+        d2_diag_writer = Writer(root_dir=result_dir, filename='d2_diag.csv', header=D2_DIAG_CSV_HEADER)
+        d2_diag_sample_writer = Writer(
+            root_dir=result_dir,
+            filename='d2_diag_samples.csv',
+            header=D2_DIAG_SAMPLE_CSV_HEADER,
+        )
     if 'webvision' in cfg.dataset:
         test_acc_writer = Writer(root_dir=result_dir, filename='test_acc.csv', header='epoch,Top1Acc,Top5Acc,ImagenetTop1Acc,ImagenetTop5Acc')
     else:
@@ -680,6 +742,8 @@ def main(gpu, cfg):
                     loss = loss_cls + cfg.alpha * loss_con_pred + cfg.gamma * loss_con_feat + cfg.beta * loss_ncr
                     josnc_loss = loss
 
+                    # D2_diag 复用 C1 实际参与 CE 的 gate；未启用或未到启动轮次时保持全 False。
+                    c1_gate_batch_mask = torch.zeros(bs, device=x1.device, dtype=torch.bool)
                     if cfg.part_ce:
                         part_ce_group = 'clean'
                         part_ce_loss = loss.new_tensor(0.0)
@@ -737,6 +801,12 @@ def main(gpu, cfg):
                                 elif num_gated == 1:
                                     # 单样本会触发 BatchNorm1d 训练模式约束，跳过并清空实际 CE gate。
                                     part_ce_batch['gate_mask'] = torch.zeros_like(gate_mask)
+                        if part_ce_batch['num_valid'] > 0 and 'gate_mask' in part_ce_batch:
+                            # D2_diag 只使用 C1 最终实际 gate，num_gated==1 被清空后不会进入 eligible 子集。
+                            c1_gate_batch_mask[part_ce_batch['batch_indices']] = part_ce_batch['gate_mask'].to(
+                                device=x1.device,
+                                dtype=torch.bool,
+                            )
                         if part_ce_writer is not None:
                             part_ce_row = build_part_ce_log_row(
                                 epoch + 1, it, part_ce_group, part_ce_batch,
@@ -882,6 +952,35 @@ def main(gpu, cfg):
                         )
                         for row in local_evidence_rows:
                             local_evidence_writer.write(format_local_evidence_row(row))
+
+                    if _should_run_d2_diag(cfg, epoch, it):
+                        # D2_diag 只读比较同一 eligible 子集上的 global logits 与 part logits 聚合结果。
+                        d2_diag_rows, d2_diag_sample_rows = compute_d2_diag(
+                            k_model, q_model, x1, y, indices, idx_clean, c1_gate_batch_mask,
+                            epoch=epoch + 1,
+                            batch_idx=it,
+                            lambdas=cfg.d2_diag_weights,
+                            aggregation_modes=cfg.d2_diag_aggregation,
+                            num_parts=cfg.multi_part_num_parts,
+                            use_accum_erase=cfg.multi_part_use_accum_erase,
+                            crop_mode=cfg.multi_part_crop_mode,
+                            window_ratio=cfg.multi_part_window_ratio,
+                            erase_mode=cfg.multi_part_erase_mode,
+                            quality_metric=cfg.multi_part_quality_metric,
+                            quality_gate_type=cfg.multi_part_quality_gate_type,
+                            quality_keep_ratio=cfg.multi_part_quality_keep_ratio,
+                            iou_filter=cfg.multi_part_iou_filter,
+                            iou_thr=cfg.multi_part_iou_thr,
+                            cam_quantile=cfg.local_evidence_cam_quantile,
+                            min_area=cfg.local_evidence_min_area,
+                            max_area=cfg.local_evidence_max_area,
+                            bbox_padding=cfg.local_evidence_bbox_padding,
+                            cam_type=cfg.local_evidence_cam_type,
+                        )
+                        for row in d2_diag_rows:
+                            d2_diag_writer.write(format_d2_diag_row(row))
+                        for row in d2_diag_sample_rows:
+                            d2_diag_sample_writer.write(format_d2_diag_sample_row(row))
 
                     if _should_run_multi_part(cfg, epoch, it):
                         # D1 只读诊断：CAM 从累计擦除图生成，part 从原图裁剪，不把多部位结果加入 loss。
@@ -1089,7 +1188,15 @@ def check_args(args):
         'multi_part_use_accum_erase', 'multi_part_save_images',
         'multi_part_image_max_samples', 'multi_part_image_samples_per_class',
         'multi_part_crop_mode', 'multi_part_window_ratio',
-        'multi_part_erase_mode'
+        'multi_part_erase_mode',
+        'd2_diag', 'd2_diag_log', 'd2_diag_groups',
+        'd2_diag_require_c1_gate', 'd2_diag_start_epoch',
+        'd2_diag_every', 'd2_diag_max_batches',
+        'd2_diag_aggregation', 'd2_diag_weights',
+        'd2_diag_use_teacher_for_quality', 'd2_diag_use_student_for_logits',
+        'multi_part_quality_metric', 'multi_part_quality_gate_type',
+        'multi_part_quality_keep_ratio', 'multi_part_iou_filter',
+        'multi_part_iou_thr'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -1280,6 +1387,40 @@ def parse_args():
     parser.add_argument('--multi-part-erase-mode', type=str, default=None,
                         help='D1 下一轮 CAM 的擦除区域：cam_mask、bbox 或 peak_window。')
 
+    # D2_diag：只做即时聚合诊断，用来判断是否值得进入 D2_safe 训练版。
+    parser.add_argument('--d2-diag', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 D2_diag 只读诊断；不加 loss，不影响训练。')
+    parser.add_argument('--d2-diag-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 d2_diag.csv 和 d2_diag_samples.csv。')
+    parser.add_argument('--d2-diag-groups', type=str, default=None,
+                        help='D2_diag 诊断组；当前仅支持 clean。')
+    parser.add_argument('--d2-diag-require-c1-gate', action=argparse.BooleanOptionalAction, default=None,
+                        help='D2_diag 是否要求样本通过 C1 clean gate。')
+    parser.add_argument('--d2-diag-start-epoch', type=int, default=None,
+                        help='D2_diag 从第几个用户可见 epoch 开始记录。')
+    parser.add_argument('--d2-diag-every', type=int, default=None,
+                        help='D2_diag 每隔多少个 epoch 运行一次。')
+    parser.add_argument('--d2-diag-max-batches', type=int, default=None,
+                        help='每个 D2_diag epoch 最多处理多少个 batch；0 表示不限制。')
+    parser.add_argument('--d2-diag-aggregation', type=str, default=None,
+                        help='D2_diag 聚合方式，逗号分隔：top1_valid,weighted_valid。')
+    parser.add_argument('--d2-diag-weights', type=str, default=None,
+                        help='D2_diag logits 聚合 lambda，逗号分隔，例如 0.05,0.1,0.2。')
+    parser.add_argument('--d2-diag-use-teacher-for-quality', action=argparse.BooleanOptionalAction, default=None,
+                        help='D2_diag 是否用 EMA teacher 做 part 质量评分。')
+    parser.add_argument('--d2-diag-use-student-for-logits', action=argparse.BooleanOptionalAction, default=None,
+                        help='D2_diag 是否用当前 student logits 做 global/part 聚合。')
+    parser.add_argument('--multi-part-quality-metric', type=str, default=None,
+                        help='D2_diag part 质量分数；当前支持 p_target_x_marginal_drop。')
+    parser.add_argument('--multi-part-quality-gate-type', type=str, default=None,
+                        help='D2_diag part 质量门控；当前支持 per_part_percentile。')
+    parser.add_argument('--multi-part-quality-keep-ratio', type=float, default=None,
+                        help='D2_diag 每个 part 内部保留的质量分位比例。')
+    parser.add_argument('--multi-part-iou-filter', action=argparse.BooleanOptionalAction, default=None,
+                        help='D2_diag 是否过滤和前序 part IoU 过高的区域。')
+    parser.add_argument('--multi-part-iou-thr', type=float, default=None,
+                        help='D2_diag IoU 去重阈值。')
+
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
     gpu = parsed_args.gpu
@@ -1350,6 +1491,23 @@ def parse_args():
     args.setdefault('multi_part_crop_mode', 'bbox')
     args.setdefault('multi_part_window_ratio', 0.35)
     args.setdefault('multi_part_erase_mode', 'cam_mask')
+    # D2_diag 默认关闭；开启后只比较同一 eligible 子集上的 global/part-logits 即时预测。
+    args.setdefault('d2_diag', False)
+    args.setdefault('d2_diag_log', True)
+    args.setdefault('d2_diag_groups', 'clean')
+    args.setdefault('d2_diag_require_c1_gate', True)
+    args.setdefault('d2_diag_start_epoch', 50)
+    args.setdefault('d2_diag_every', 1)
+    args.setdefault('d2_diag_max_batches', 0)
+    args.setdefault('d2_diag_aggregation', ['top1_valid', 'weighted_valid'])
+    args.setdefault('d2_diag_weights', [0.05, 0.1, 0.2])
+    args.setdefault('d2_diag_use_teacher_for_quality', True)
+    args.setdefault('d2_diag_use_student_for_logits', True)
+    args.setdefault('multi_part_quality_metric', 'p_target_x_marginal_drop')
+    args.setdefault('multi_part_quality_gate_type', 'per_part_percentile')
+    args.setdefault('multi_part_quality_keep_ratio', 0.5)
+    args.setdefault('multi_part_iou_filter', True)
+    args.setdefault('multi_part_iou_thr', 0.5)
     # C1/C2/D1 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()
@@ -1360,6 +1518,29 @@ def parse_args():
     args['multi_part_groups'] = ','.join(
         item.strip().lower() for item in str(args['multi_part_groups']).split(',') if item.strip()
     )
+    args['d2_diag_groups'] = str(args['d2_diag_groups']).strip().lower()
+    args['multi_part_quality_metric'] = str(args['multi_part_quality_metric']).lower()
+    args['multi_part_quality_gate_type'] = str(args['multi_part_quality_gate_type']).lower()
+    if isinstance(args['d2_diag_aggregation'], str):
+        args['d2_diag_aggregation'] = [
+            item.strip().lower()
+            for item in args['d2_diag_aggregation'].split(',')
+            if item.strip()
+        ]
+    else:
+        args['d2_diag_aggregation'] = [
+            str(item).strip().lower()
+            for item in args['d2_diag_aggregation']
+            if str(item).strip()
+        ]
+    if isinstance(args['d2_diag_weights'], str):
+        args['d2_diag_weights'] = [
+            float(item.strip())
+            for item in args['d2_diag_weights'].split(',')
+            if item.strip()
+        ]
+    else:
+        args['d2_diag_weights'] = [float(item) for item in args['d2_diag_weights']]
     assert check_args(args)
     return gpu, edict(args)
 
