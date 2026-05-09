@@ -40,6 +40,7 @@ from utils.local_evidence import (
     ID_CANDIDATE_CSV_HEADER,
     ID_CANDIDATE_SAMPLE_CSV_HEADER,
     LOCAL_EVIDENCE_CSV_HEADER,
+    LOCAL_MARGIN_CSV_HEADER,
     MULTI_PART_CSV_HEADER,
     MULTI_PART_SAMPLE_CSV_HEADER,
     PART_CE_GATE_SAMPLE_CSV_HEADER,
@@ -50,18 +51,21 @@ from utils.local_evidence import (
     build_id_candidate_sample_rows,
     build_gate_mask,
     build_local_part_batch,
+    build_local_margin_log_row,
     build_part_ce_gate_sample_rows,
     build_part_ce_log_row,
     compute_id_candidate_effective_weight,
     compute_id_candidate_loss,
     compute_d2_diag,
     compute_local_evidence,
+    compute_local_margin_loss,
     compute_multi_part_evidence,
     format_d2_diag_row,
     format_d2_diag_sample_row,
     format_id_candidate_row,
     format_id_candidate_sample_row,
     format_local_evidence_row,
+    format_local_margin_row,
     format_multi_part_row,
     format_multi_part_sample_row,
     format_part_ce_gate_sample_row,
@@ -387,6 +391,23 @@ def main(gpu, cfg):
         raise ValueError(f'part_ce_gate_type should be fixed or percentile, got {cfg.part_ce_gate_type}.')
     if not (0.0 <= cfg.part_ce_gate_keep_ratio <= 1.0):
         raise ValueError(f'part_ce_gate_keep_ratio should be within [0, 1], got {cfg.part_ce_gate_keep_ratio}.')
+    if cfg.local_margin:
+        if cfg.local_margin_groups != 'clean':
+            raise ValueError(f'D3 local_margin currently supports clean only, got {cfg.local_margin_groups}.')
+        if cfg.local_margin_weight < 0.0:
+            raise ValueError(f'local_margin_weight should be non-negative, got {cfg.local_margin_weight}.')
+        if cfg.local_margin_margin < 0.0:
+            raise ValueError(f'local_margin_margin should be non-negative, got {cfg.local_margin_margin}.')
+        if cfg.local_margin_start_epoch < 0:
+            raise ValueError(f'local_margin_start_epoch should be non-negative, got {cfg.local_margin_start_epoch}.')
+        if cfg.local_margin_hard_negative != 'max_non_target':
+            raise ValueError(
+                f'local_margin_hard_negative should be max_non_target, got {cfg.local_margin_hard_negative}.'
+            )
+        if not cfg.local_margin_use_logits:
+            raise ValueError('D3 local_margin first version requires local_margin_use_logits=true.')
+        if cfg.local_margin_require_c1_gate and not cfg.part_ce_gate:
+            raise ValueError('D3 local_margin requires part_ce_gate=true when local_margin_require_c1_gate=true.')
     if not (1 <= cfg.id_candidate_topk <= cfg.n_classes):
         raise ValueError(f'id_candidate_topk should be within [1, {cfg.n_classes}], got {cfg.id_candidate_topk}.')
     if cfg.id_candidate_cam_target not in ['teacher_top1']:
@@ -487,6 +508,10 @@ def main(gpu, cfg):
             filename='part_ce_gate_samples.csv',
             header=PART_CE_GATE_SAMPLE_CSV_HEADER,
         )
+    local_margin_writer = None
+    if cfg.local_margin and cfg.local_margin_log:
+        # D3 单独写 margin 诊断，避免和 C1 CE 日志混淆 loss 强度。
+        local_margin_writer = Writer(root_dir=result_dir, filename='local_margin.csv', header=LOCAL_MARGIN_CSV_HEADER)
     id_candidate_writer = None
     id_candidate_sample_writer = None
     if cfg.id_candidate and cfg.id_candidate_log:
@@ -742,15 +767,16 @@ def main(gpu, cfg):
                     loss = loss_cls + cfg.alpha * loss_con_pred + cfg.gamma * loss_con_feat + cfg.beta * loss_ncr
                     josnc_loss = loss
 
-                    # D2_diag 复用 C1 实际参与 CE 的 gate；未启用或未到启动轮次时保持全 False。
+                    # D2_diag/D3 复用 C1 实际 gate；未启用或未到启动轮次时保持全 False。
                     c1_gate_batch_mask = torch.zeros(bs, device=x1.device, dtype=torch.bool)
-                    if cfg.part_ce:
-                        part_ce_group = 'clean'
-                        part_ce_loss = loss.new_tensor(0.0)
-                        part_ce_batch = {'num_selected': int(idx_clean.numel()), 'num_valid': 0}
+                    clean_part_group = 'clean'
+                    part_ce_loss = loss.new_tensor(0.0)
+                    local_margin_result = None
+                    clean_part_batch = {'num_selected': int(idx_clean.numel()), 'num_valid': 0}
+                    if cfg.part_ce or cfg.local_margin:
                         if idx_clean.numel() > 0:
                             cam_model = k_model if cfg.part_ce_use_teacher_cam else q_model
-                            part_ce_batch = build_local_part_batch(
+                            clean_part_batch = build_local_part_batch(
                                 cam_model, x1, y, idx_clean,
                                 cam_quantile=cfg.local_evidence_cam_quantile,
                                 min_area=cfg.local_evidence_min_area,
@@ -758,69 +784,93 @@ def main(gpu, cfg):
                                 bbox_padding=cfg.local_evidence_bbox_padding,
                                 cam_type=cfg.local_evidence_cam_type,
                             )
-                            if part_ce_batch['num_valid'] > 0 and part_ce_batch['x_part'].numel() > 0:
-                                # B1/C1 共用局部图生成；C1 未到启动 epoch 时不退化成 B1。
-                                if cfg.part_ce_gate:
+                            if clean_part_batch['num_valid'] > 0 and clean_part_batch['x_part'].numel() > 0:
+                                # C1/D3 共用局部图和 evidence gate；D3 不另算自己的 gate。
+                                use_c1_gate = cfg.part_ce_gate or (
+                                    cfg.local_margin and cfg.local_margin_require_c1_gate
+                                )
+                                if use_c1_gate:
                                     if (epoch + 1) >= cfg.part_ce_gate_start_epoch:
                                         gate_mask, gate_threshold = build_gate_mask(
-                                            part_ce_batch['evidence_score'],
+                                            clean_part_batch['evidence_score'],
                                             gate_type=cfg.part_ce_gate_type,
                                             threshold=cfg.part_ce_gate_threshold,
                                             keep_ratio=cfg.part_ce_gate_keep_ratio,
                                         )
                                     else:
                                         gate_mask = torch.zeros(
-                                            part_ce_batch['num_valid'],
+                                            clean_part_batch['num_valid'],
                                             device=x1.device,
                                             dtype=torch.bool,
                                         )
-                                        gate_threshold = part_ce_batch['evidence_score'].new_tensor(0.0)
+                                        gate_threshold = clean_part_batch['evidence_score'].new_tensor(0.0)
                                 else:
                                     gate_mask = torch.ones(
-                                        part_ce_batch['num_valid'],
+                                        clean_part_batch['num_valid'],
                                         device=x1.device,
                                         dtype=torch.bool,
                                     )
-                                    gate_threshold = part_ce_batch['evidence_score'].new_tensor(0.0)
-                                part_ce_batch['gate_mask'] = gate_mask
-                                part_ce_batch['gate_threshold'] = gate_threshold
+                                    gate_threshold = clean_part_batch['evidence_score'].new_tensor(0.0)
+                                clean_part_batch['gate_mask'] = gate_mask
+                                clean_part_batch['gate_threshold'] = gate_threshold
+                                clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
 
                                 num_gated = int(gate_mask.sum().item())
-                                if num_gated > 1:
-                                    # 只有实际通过门控的局部图进入 student 前向和 CE 反传。
+                                run_part_ce_loss = cfg.part_ce
+                                run_local_margin_loss = cfg.local_margin and (epoch + 1) >= cfg.local_margin_start_epoch
+                                if num_gated > 1 and (run_part_ce_loss or run_local_margin_loss):
+                                    # 只有实际通过 C1 gate 的局部图进入 student 前向和辅助 loss 反传。
                                     student_was_training = q_model.training
                                     q_model.train()
                                     try:
-                                        logits_part = q_model(part_ce_batch['x_part'][gate_mask])[0]
-                                        labels_part = part_ce_batch['labels'][gate_mask]
-                                        part_ce_loss = F.cross_entropy(logits_part, labels_part)
+                                        logits_part = q_model(clean_part_batch['x_part'][gate_mask])[0]
+                                        labels_part = clean_part_batch['labels'][gate_mask]
+                                        if run_part_ce_loss:
+                                            part_ce_loss = F.cross_entropy(logits_part, labels_part)
+                                            loss = loss + cfg.part_ce_weight * part_ce_loss
+                                        if run_local_margin_loss:
+                                            local_margin_result = compute_local_margin_loss(
+                                                logits_part, labels_part,
+                                                margin=cfg.local_margin_margin,
+                                                hard_negative=cfg.local_margin_hard_negative,
+                                                use_logits=cfg.local_margin_use_logits,
+                                            )
+                                            local_margin_loss = local_margin_result['loss']
+                                            loss = loss + cfg.local_margin_weight * local_margin_loss
+                                            clean_part_batch['local_margin_mask'] = gate_mask.detach().clone()
                                     finally:
                                         if not student_was_training:
                                             q_model.eval()
-                                    loss = loss + cfg.part_ce_weight * part_ce_loss
                                 elif num_gated == 1:
-                                    # 单样本会触发 BatchNorm1d 训练模式约束，跳过并清空实际 CE gate。
-                                    part_ce_batch['gate_mask'] = torch.zeros_like(gate_mask)
-                        if part_ce_batch['num_valid'] > 0 and 'gate_mask' in part_ce_batch:
-                            # D2_diag 只使用 C1 最终实际 gate，num_gated==1 被清空后不会进入 eligible 子集。
-                            c1_gate_batch_mask[part_ce_batch['batch_indices']] = part_ce_batch['gate_mask'].to(
+                                    # 单样本会触发 BatchNorm1d 训练模式约束，跳过并清空实际 gate。
+                                    clean_part_batch['gate_mask'] = torch.zeros_like(gate_mask)
+                                    clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
+                        if clean_part_batch['num_valid'] > 0 and 'gate_mask' in clean_part_batch:
+                            # D2_diag/D3 只使用 C1 最终实际 gate，num_gated==1 被清空后不会进入 eligible 子集。
+                            c1_gate_batch_mask[clean_part_batch['batch_indices']] = clean_part_batch['gate_mask'].to(
                                 device=x1.device,
                                 dtype=torch.bool,
                             )
                         if part_ce_writer is not None:
                             part_ce_row = build_part_ce_log_row(
-                                epoch + 1, it, part_ce_group, part_ce_batch,
+                                epoch + 1, it, clean_part_group, clean_part_batch,
                                 josnc_loss, part_ce_loss, cfg.part_ce_weight
                             )
                             part_ce_writer.write(format_part_ce_row(part_ce_row))
-                        if part_ce_gate_sample_writer is not None and part_ce_batch['num_valid'] > 0:
+                        if part_ce_gate_sample_writer is not None and clean_part_batch['num_valid'] > 0:
                             # C1 逐样本 gate 日志记录实际参与 CE 的 gate，用于后续分析长期过滤样本。
                             gate_sample_rows = build_part_ce_gate_sample_rows(
-                                epoch + 1, it, part_ce_group, part_ce_batch, indices,
+                                epoch + 1, it, clean_part_group, clean_part_batch, indices,
                                 student_logits=logits1,
                             )
                             for row in gate_sample_rows:
                                 part_ce_gate_sample_writer.write(format_part_ce_gate_sample_row(row))
+                        if local_margin_writer is not None:
+                            local_margin_row = build_local_margin_log_row(
+                                epoch + 1, it, clean_part_group, clean_part_batch,
+                                loss, local_margin_result, cfg.local_margin_weight,
+                            )
+                            local_margin_writer.write(format_local_margin_row(local_margin_row))
 
                     if cfg.id_candidate:
                         id_candidate_loss = loss.new_tensor(0.0)
@@ -1173,6 +1223,9 @@ def check_args(args):
         'part_ce', 'part_ce_weight', 'part_ce_groups', 'part_ce_use_teacher_cam', 'part_ce_log',
         'part_ce_gate', 'part_ce_gate_type', 'part_ce_gate_threshold',
         'part_ce_gate_keep_ratio', 'part_ce_gate_start_epoch',
+        'local_margin', 'local_margin_groups', 'local_margin_require_c1_gate',
+        'local_margin_start_epoch', 'local_margin_weight', 'local_margin_margin',
+        'local_margin_hard_negative', 'local_margin_use_logits', 'local_margin_log',
         'id_candidate', 'id_candidate_weight', 'id_candidate_topk',
         'id_candidate_start_epoch', 'id_candidate_log',
         'id_candidate_cam_target', 'id_candidate_score_type',
@@ -1313,6 +1366,26 @@ def parse_args():
                         help='C1 percentile 门控保留比例。')
     parser.add_argument('--part-ce-gate-start-epoch', type=int, default=None,
                         help='从第几个用户可见 epoch 开始启用 C1 门控局部 CE。')
+
+    # D3 clean-gated local margin：复用 C1 actual gate，只把 clean 局部 CE 换成 logits margin。
+    parser.add_argument('--local-margin', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 D3 clean-gated local margin 分支。')
+    parser.add_argument('--local-margin-groups', type=str, default=None,
+                        help='D3 使用哪些 Jo-SNC 分组；第一版只支持 clean。')
+    parser.add_argument('--local-margin-require-c1-gate', action=argparse.BooleanOptionalAction, default=None,
+                        help='D3 是否必须复用 C1 actual gate；第一版建议保持 true。')
+    parser.add_argument('--local-margin-start-epoch', type=int, default=None,
+                        help='从第几个用户可见 epoch 开始启用 D3 margin loss。')
+    parser.add_argument('--local-margin-weight', type=float, default=None,
+                        help='D3 margin loss 加到总 loss 的权重。')
+    parser.add_argument('--local-margin-margin', type=float, default=None,
+                        help='D3 logits margin 阈值。')
+    parser.add_argument('--local-margin-hard-negative', type=str, default=None,
+                        help='D3 hard negative 选择方式；第一版只支持 max_non_target。')
+    parser.add_argument('--local-margin-use-logits', action=argparse.BooleanOptionalAction, default=None,
+                        help='D3 是否使用 logits margin；第一版必须为 true。')
+    parser.add_argument('--local-margin-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 local_margin.csv 诊断日志。')
 
     # C2 ID noisy 候选标签：使用 teacher-top1 单 CAM 构造候选集合，再按配置选择 PLL 或 capped soft target。
     parser.add_argument('--id-candidate', action=argparse.BooleanOptionalAction, default=None,
@@ -1484,6 +1557,16 @@ def parse_args():
     args.setdefault('part_ce_gate_threshold', 0.10)
     args.setdefault('part_ce_gate_keep_ratio', 0.50)
     args.setdefault('part_ce_gate_start_epoch', 20)
+    # D3 默认关闭；开启后复用 C1 actual gate，在同一批 clean x_part 上加 logits margin。
+    args.setdefault('local_margin', False)
+    args.setdefault('local_margin_groups', 'clean')
+    args.setdefault('local_margin_require_c1_gate', True)
+    args.setdefault('local_margin_start_epoch', 20)
+    args.setdefault('local_margin_weight', 0.05)
+    args.setdefault('local_margin_margin', 0.5)
+    args.setdefault('local_margin_hard_negative', 'max_non_target')
+    args.setdefault('local_margin_use_logits', True)
+    args.setdefault('local_margin_log', True)
     # C2 默认关闭；启用后可在 PLL、熵约束、capped soft target 和 v4 衰减过滤间组合。
     args.setdefault('id_candidate', False)
     args.setdefault('id_candidate_weight', 0.3)
@@ -1539,6 +1622,8 @@ def parse_args():
     args.setdefault('multi_part_iou_thr', 0.5)
     # C1/C2/D1 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
+    args['local_margin_groups'] = str(args['local_margin_groups']).strip().lower()
+    args['local_margin_hard_negative'] = str(args['local_margin_hard_negative']).strip().lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()
     args['id_candidate_score_type'] = str(args['id_candidate_score_type']).lower()
     args['id_candidate_loss_type'] = str(args['id_candidate_loss_type']).lower()

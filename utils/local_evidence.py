@@ -33,6 +33,14 @@ PART_CE_GATE_SAMPLE_CSV_HEADER = (
     'p_ori_y,p_part_y,p_erase_y,erase_drop,bbox_area,pred_top1,pred_conf'
 )
 
+LOCAL_MARGIN_CSV_HEADER = (
+    'epoch,batch_idx,group,num_selected,num_valid,num_margin_valid,margin_valid_ratio,'
+    'raw_local_margin_loss,weighted_local_margin_loss,weighted_local_margin_loss_ratio,'
+    'part_target_logit_mean,part_hardneg_logit_mean,part_margin_mean,'
+    'part_margin_p25,part_margin_p50,part_margin_p75,part_margin_violate_ratio,'
+    'hardneg_class_eq_pred_ratio'
+)
+
 ID_CANDIDATE_CSV_HEADER = (
     'epoch,batch_idx,num_selected,num_valid,id_candidate_loss,'
     'id_candidate_weight,weighted_id_candidate_loss,loss_ratio,'
@@ -130,6 +138,22 @@ def format_part_ce_gate_sample_row(row):
         f"{row['gate']},{row['p_ori_y']:.6f},{row['p_part_y']:.6f},"
         f"{row['p_erase_y']:.6f},{row['erase_drop']:.6f},"
         f"{row['bbox_area']:.6f},{row['pred_top1']},{row['pred_conf']:.6f}"
+    )
+
+
+def format_local_margin_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['group']},"
+        f"{row['num_selected']},{row['num_valid']},{row['num_margin_valid']},"
+        f"{row['margin_valid_ratio']:.6f},{row['raw_local_margin_loss']:.6f},"
+        f"{row['weighted_local_margin_loss']:.6f},"
+        f"{row['weighted_local_margin_loss_ratio']:.6f},"
+        f"{row['part_target_logit_mean']:.6f},"
+        f"{row['part_hardneg_logit_mean']:.6f},"
+        f"{row['part_margin_mean']:.6f},{row['part_margin_p25']:.6f},"
+        f"{row['part_margin_p50']:.6f},{row['part_margin_p75']:.6f},"
+        f"{row['part_margin_violate_ratio']:.6f},"
+        f"{row['hardneg_class_eq_pred_ratio']:.6f}"
     )
 
 
@@ -1015,6 +1039,51 @@ def compute_id_candidate_loss(
     return result
 
 
+def compute_local_margin_loss(logits_part, labels, margin=0.5,
+                              hard_negative='max_non_target', use_logits=True):
+    hard_negative = str(hard_negative).lower()
+    if hard_negative != 'max_non_target':
+        raise ValueError(f'local_margin_hard_negative only supports max_non_target, got {hard_negative}.')
+    if not use_logits:
+        raise ValueError('local_margin first version only supports logits margin.')
+
+    labels = labels.detach().long()
+    if logits_part.numel() == 0 or labels.numel() == 0:
+        zero_loss = logits_part.sum() * 0.0
+        empty = logits_part.new_zeros((0,), dtype=torch.float)
+        empty_long = labels.new_zeros((0,), dtype=torch.long)
+        return {
+            'loss': zero_loss,
+            'losses': empty,
+            'target_logits': empty,
+            'hardneg_logits': empty,
+            'part_margin': empty,
+            'hardneg_class': empty_long,
+            'pred_class': empty_long,
+            'violate_mask': empty.to(dtype=torch.bool),
+        }
+
+    # D3 使用 logits margin，避免 probability margin 受到 softmax 饱和影响。
+    logits = logits_part.float()
+    target_logits = logits.gather(1, labels.view(-1, 1)).squeeze(1)
+    non_target_logits = logits.clone()
+    non_target_logits.scatter_(1, labels.view(-1, 1), torch.finfo(logits.dtype).min)
+    hardneg_logits, hardneg_class = non_target_logits.max(dim=1)
+    part_margin = target_logits - hardneg_logits
+    losses = F.relu(float(margin) - part_margin)
+    pred_class = logits.detach().argmax(dim=1)
+    return {
+        'loss': losses.mean(),
+        'losses': losses,
+        'target_logits': target_logits.detach(),
+        'hardneg_logits': hardneg_logits.detach(),
+        'part_margin': part_margin.detach(),
+        'hardneg_class': hardneg_class.detach(),
+        'pred_class': pred_class.detach(),
+        'violate_mask': (part_margin.detach() < float(margin)),
+    }
+
+
 def compute_id_candidate_pll_loss(logits, candidate_mask, entropy_weight=0.0, entropy_min_ratio=0.0):
     result = compute_id_candidate_loss(
         logits, candidate_mask,
@@ -1053,6 +1122,50 @@ def attach_id_candidate_loss_results(candidate_batch, result1, result2, used_mas
         full_values[used_mask.to(device=metric_values.device)] = metric_values
         candidate_batch[batch_key] = full_values
     return candidate_batch
+
+
+def build_local_margin_log_row(epoch, batch_idx, group, part_batch, total_loss,
+                               margin_result, local_margin_weight):
+    num_selected = int(part_batch['num_selected'])
+    num_valid = int(part_batch['num_valid'])
+    if margin_result is None:
+        return _empty_local_margin_log_row(epoch, batch_idx, group, num_selected, num_valid)
+
+    part_margin = margin_result['part_margin'].detach()
+    num_margin_valid = int(part_margin.numel())
+    if num_margin_valid == 0:
+        return _empty_local_margin_log_row(epoch, batch_idx, group, num_selected, num_valid)
+
+    raw_loss = float(margin_result['loss'].detach().item())
+    weighted_loss = float(local_margin_weight) * raw_loss
+    total_loss_value = float(total_loss.detach().item())
+    # D3 日志把加权 margin loss 除以当前 total loss，便于判断分支强弱。
+    loss_ratio = weighted_loss / max(abs(total_loss_value), 1e-12)
+    violate_mask = margin_result['violate_mask'].detach().to(dtype=torch.float)
+    hardneg_eq_pred = (
+        margin_result['hardneg_class'].detach() == margin_result['pred_class'].detach()
+    ).to(dtype=torch.float)
+
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'num_selected': num_selected,
+        'num_valid': num_valid,
+        'num_margin_valid': num_margin_valid,
+        'margin_valid_ratio': float(num_margin_valid / max(num_valid, 1)),
+        'raw_local_margin_loss': raw_loss,
+        'weighted_local_margin_loss': weighted_loss,
+        'weighted_local_margin_loss_ratio': loss_ratio,
+        'part_target_logit_mean': _mean_or_zero(margin_result['target_logits']),
+        'part_hardneg_logit_mean': _mean_or_zero(margin_result['hardneg_logits']),
+        'part_margin_mean': _mean_or_zero(part_margin),
+        'part_margin_p25': _quantile_or_zero(part_margin, 0.25),
+        'part_margin_p50': _quantile_or_zero(part_margin, 0.50),
+        'part_margin_p75': _quantile_or_zero(part_margin, 0.75),
+        'part_margin_violate_ratio': _mean_or_zero(violate_mask),
+        'hardneg_class_eq_pred_ratio': _mean_or_zero(hardneg_eq_pred),
+    }
 
 
 def build_part_ce_log_row(epoch, batch_idx, group, part_batch, josnc_loss,
@@ -1753,6 +1866,29 @@ def _empty_part_ce_log_row(epoch, batch_idx, group, num_selected, num_valid,
     }
 
 
+def _empty_local_margin_log_row(epoch, batch_idx, group, num_selected, num_valid):
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'num_selected': int(num_selected),
+        'num_valid': int(num_valid),
+        'num_margin_valid': 0,
+        'margin_valid_ratio': 0.0,
+        'raw_local_margin_loss': 0.0,
+        'weighted_local_margin_loss': 0.0,
+        'weighted_local_margin_loss_ratio': 0.0,
+        'part_target_logit_mean': 0.0,
+        'part_hardneg_logit_mean': 0.0,
+        'part_margin_mean': 0.0,
+        'part_margin_p25': 0.0,
+        'part_margin_p50': 0.0,
+        'part_margin_p75': 0.0,
+        'part_margin_violate_ratio': 0.0,
+        'hardneg_class_eq_pred_ratio': 0.0,
+    }
+
+
 def _empty_id_candidate_log_row(epoch, batch_idx, num_selected, num_valid,
                                 id_candidate_loss, id_candidate_weight,
                                 weighted_id_candidate_loss, loss_ratio,
@@ -1818,6 +1954,13 @@ def _mean_or_zero(values):
     if values.numel() == 0:
         return 0.0
     return float(values.detach().mean().item())
+
+
+def _quantile_or_zero(values, quantile):
+    values = values.detach().float()
+    if values.numel() == 0:
+        return 0.0
+    return float(torch.quantile(values, float(quantile)).item())
 
 
 def _mean_or_zero_or_none(values, mask=None):
