@@ -54,7 +54,7 @@ local_evidence_cam_type: weightcam
 local_evidence_save_images: false
 local_evidence_image_max_samples: 8
 
-# C1 gate is kept on so D3 can reuse the exact C1 actual gate mask.
+# Shared C1 evidence gate parameters. E1 uses the gate without enabling part CE.
 part_ce: false
 part_ce_weight: 0.5
 part_ce_groups: clean
@@ -66,23 +66,23 @@ part_ce_gate_threshold: 0.10
 part_ce_gate_keep_ratio: 0.50
 part_ce_gate_start_epoch: 20
 
-# D3 replace-CE local margin
-local_margin: true
-local_margin_groups: clean
-local_margin_require_c1_gate: true
-local_margin_start_epoch: 20
-local_margin_weight: 0.05
-local_margin_margin: 0.5
-local_margin_hard_negative: max_non_target
-local_margin_use_logits: true
-local_margin_log: true
+# E1 clean original-image CE reweight
+evidence_clean_reweight: true
+evidence_clean_reweight_start_epoch: 20
+evidence_clean_reweight_groups: clean
+evidence_clean_reweight_type: binary
+evidence_clean_high_weight: 1.0
+evidence_clean_low_weight: 0.5
+evidence_clean_use_c1_gate: true
+evidence_clean_reweight_log: true
 
-# C2/D1/D2 are off for the first clean D3 attribution run.
+# Keep other experimental branches off for attribution.
+local_margin: false
 id_candidate: false
 multi_part: false
 d2_diag: false
 
 # logging
 log_root: ./results/
-log_proj: ''
-log_name: D3_margin_replaceCE_w005_m05
+log_proj: benchmark_webfg
+log_name: E1_clean_reweight_binary_w1_w05

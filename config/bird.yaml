@@ -23,11 +23,23 @@ eps: 0.3
 alpha: 0.3
 beta: 0.8
 gamma: 0.001
+delta: 0.0
 fdim: 256
+hdim: 2
 queue_length: 32000
+knet_m: 0.99
 n_neighbors: 10
 topK: 10
+topK_decay: 1000
 tau_m: 0.98
+transform: strong
+cls4ood: nl
+cls4id: ce
+ncr_lossfunc: kldiv
+integrate_mode: or
+ood_criterion: div
+threshold_generator: per_class_mean
+conf_weight: true
 # Warmup omega_tau is fixed to 0.75 in main.py.
 
 # A1

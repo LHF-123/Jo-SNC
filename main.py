@@ -37,6 +37,7 @@ from utils.loss import *
 from utils.local_evidence import (
     D2_DIAG_CSV_HEADER,
     D2_DIAG_SAMPLE_CSV_HEADER,
+    EVIDENCE_CLEAN_REWEIGHT_CSV_HEADER,
     ID_CANDIDATE_CSV_HEADER,
     ID_CANDIDATE_SAMPLE_CSV_HEADER,
     LOCAL_EVIDENCE_CSV_HEADER,
@@ -46,6 +47,8 @@ from utils.local_evidence import (
     PART_CE_GATE_SAMPLE_CSV_HEADER,
     PART_CE_CSV_HEADER,
     attach_id_candidate_loss_results,
+    build_evidence_clean_reweight_log_row,
+    build_evidence_clean_weights,
     build_id_candidate_batch,
     build_id_candidate_log_row,
     build_id_candidate_sample_rows,
@@ -62,6 +65,7 @@ from utils.local_evidence import (
     compute_multi_part_evidence,
     format_d2_diag_row,
     format_d2_diag_sample_row,
+    format_evidence_clean_reweight_row,
     format_id_candidate_row,
     format_id_candidate_sample_row,
     format_local_evidence_row,
@@ -408,6 +412,25 @@ def main(gpu, cfg):
             raise ValueError('D3 local_margin first version requires local_margin_use_logits=true.')
         if cfg.local_margin_require_c1_gate and not cfg.part_ce_gate:
             raise ValueError('D3 local_margin requires part_ce_gate=true when local_margin_require_c1_gate=true.')
+    if cfg.evidence_clean_reweight:
+        if cfg.evidence_clean_reweight_groups != 'clean':
+            raise ValueError(
+                f'E1 evidence_clean_reweight currently supports clean only, got {cfg.evidence_clean_reweight_groups}.'
+            )
+        if cfg.evidence_clean_reweight_type != 'binary':
+            raise ValueError(
+                f'E1 evidence_clean_reweight_type should be binary, got {cfg.evidence_clean_reweight_type}.'
+            )
+        if cfg.evidence_clean_reweight_start_epoch < 0:
+            raise ValueError('evidence_clean_reweight_start_epoch should be non-negative.')
+        if cfg.evidence_clean_low_weight < 0.0:
+            raise ValueError('evidence_clean_low_weight should be non-negative.')
+        if cfg.evidence_clean_high_weight < cfg.evidence_clean_low_weight:
+            raise ValueError('evidence_clean_high_weight should be >= evidence_clean_low_weight.')
+        if cfg.evidence_clean_use_c1_gate and not cfg.part_ce_gate:
+            raise ValueError('E1 requires part_ce_gate=true when evidence_clean_use_c1_gate=true.')
+        if cfg.evidence_clean_use_c1_gate and cfg.part_ce_gate_type != 'percentile':
+            raise ValueError('E1 first version requires part_ce_gate_type=percentile.')
     if not (1 <= cfg.id_candidate_topk <= cfg.n_classes):
         raise ValueError(f'id_candidate_topk should be within [1, {cfg.n_classes}], got {cfg.id_candidate_topk}.')
     if cfg.id_candidate_cam_target not in ['teacher_top1']:
@@ -512,6 +535,14 @@ def main(gpu, cfg):
     if cfg.local_margin and cfg.local_margin_log:
         # D3 单独写 margin 诊断，避免和 C1 CE 日志混淆 loss 强度。
         local_margin_writer = Writer(root_dir=result_dir, filename='local_margin.csv', header=LOCAL_MARGIN_CSV_HEADER)
+    evidence_clean_reweight_writer = None
+    if cfg.evidence_clean_reweight and cfg.evidence_clean_reweight_log:
+        # E1 记录 clean 主 loss 的证据调权强度，不新增局部分支 loss。
+        evidence_clean_reweight_writer = Writer(
+            root_dir=result_dir,
+            filename='evidence_clean_reweight.csv',
+            header=EVIDENCE_CLEAN_REWEIGHT_CSV_HEADER,
+        )
     id_candidate_writer = None
     id_candidate_sample_writer = None
     if cfg.id_candidate and cfg.id_candidate_log:
@@ -739,6 +770,75 @@ def main(gpu, cfg):
                         losses_cls_ood = losses_cls_ood * torch.square(1-least_scores[idx_ood])
                     else:
                         raise AssertionError(f'cls4ood: {cfg.cls4ood} is not supported!')
+
+                    # C1/D3/E1 共用 clean 局部证据 gate；E1 必须在 clean loss 汇总前完成调权。
+                    c1_gate_batch_mask = torch.zeros(bs, device=x1.device, dtype=torch.bool)
+                    clean_part_group = 'clean'
+                    part_ce_loss = losses_cls_clean.new_tensor(0.0)
+                    local_margin_result = None
+                    evidence_clean_context = None
+                    clean_loss_weight = torch.ones_like(losses_cls_clean)
+                    raw_clean_losses = losses_cls_clean.detach()
+                    clean_part_batch = {'num_selected': int(idx_clean.numel()), 'num_valid': 0}
+                    run_evidence_clean_reweight = (
+                        cfg.evidence_clean_reweight
+                        and (epoch + 1) >= cfg.evidence_clean_reweight_start_epoch
+                        and (epoch + 1) >= cfg.part_ce_gate_start_epoch
+                    )
+                    need_clean_part_gate = cfg.part_ce or cfg.local_margin or run_evidence_clean_reweight
+                    if need_clean_part_gate and idx_clean.numel() > 0:
+                        cam_model = k_model if cfg.part_ce_use_teacher_cam else q_model
+                        clean_part_batch = build_local_part_batch(
+                            cam_model, x1, y, idx_clean,
+                            cam_quantile=cfg.local_evidence_cam_quantile,
+                            min_area=cfg.local_evidence_min_area,
+                            max_area=cfg.local_evidence_max_area,
+                            bbox_padding=cfg.local_evidence_bbox_padding,
+                            cam_type=cfg.local_evidence_cam_type,
+                        )
+                        if clean_part_batch['num_valid'] > 0 and clean_part_batch['x_part'].numel() > 0:
+                            use_c1_gate = cfg.part_ce_gate or (
+                                cfg.local_margin and cfg.local_margin_require_c1_gate
+                            ) or (
+                                cfg.evidence_clean_reweight and cfg.evidence_clean_use_c1_gate
+                            )
+                            if use_c1_gate:
+                                if (epoch + 1) >= cfg.part_ce_gate_start_epoch:
+                                    gate_mask, gate_threshold = build_gate_mask(
+                                        clean_part_batch['evidence_score'],
+                                        gate_type=cfg.part_ce_gate_type,
+                                        threshold=cfg.part_ce_gate_threshold,
+                                        keep_ratio=cfg.part_ce_gate_keep_ratio,
+                                    )
+                                else:
+                                    gate_mask = torch.zeros(
+                                        clean_part_batch['num_valid'],
+                                        device=x1.device,
+                                        dtype=torch.bool,
+                                    )
+                                    gate_threshold = clean_part_batch['evidence_score'].new_tensor(0.0)
+                            else:
+                                gate_mask = torch.ones(
+                                    clean_part_batch['num_valid'],
+                                    device=x1.device,
+                                    dtype=torch.bool,
+                                )
+                                gate_threshold = clean_part_batch['evidence_score'].new_tensor(0.0)
+                            clean_part_batch['evidence_gate_mask'] = gate_mask
+                            clean_part_batch['gate_mask'] = gate_mask
+                            clean_part_batch['gate_threshold'] = gate_threshold
+                            clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
+
+                    if run_evidence_clean_reweight:
+                        clean_loss_weight, evidence_clean_context = build_evidence_clean_weights(
+                            idx_clean, clean_part_batch, losses_cls_clean,
+                            high_weight=cfg.evidence_clean_high_weight,
+                            low_weight=cfg.evidence_clean_low_weight,
+                            batch_size=bs,
+                        )
+                        # E1 是原图 clean CE 的样本权重，不允许通过 evidence 路径反传。
+                        losses_cls_clean = losses_cls_clean * clean_loss_weight.detach()
+
                     losses_pll_all = torch.cat((losses_cls_clean, losses_cls_id, losses_cls_ood), dim=0)
                     loss_cls = losses_pll_all.mean()
 
@@ -767,110 +867,73 @@ def main(gpu, cfg):
                     loss = loss_cls + cfg.alpha * loss_con_pred + cfg.gamma * loss_con_feat + cfg.beta * loss_ncr
                     josnc_loss = loss
 
-                    # D2_diag/D3 复用 C1 实际 gate；未启用或未到启动轮次时保持全 False。
-                    c1_gate_batch_mask = torch.zeros(bs, device=x1.device, dtype=torch.bool)
-                    clean_part_group = 'clean'
-                    part_ce_loss = loss.new_tensor(0.0)
-                    local_margin_result = None
-                    clean_part_batch = {'num_selected': int(idx_clean.numel()), 'num_valid': 0}
-                    if cfg.part_ce or cfg.local_margin:
-                        if idx_clean.numel() > 0:
-                            cam_model = k_model if cfg.part_ce_use_teacher_cam else q_model
-                            clean_part_batch = build_local_part_batch(
-                                cam_model, x1, y, idx_clean,
-                                cam_quantile=cfg.local_evidence_cam_quantile,
-                                min_area=cfg.local_evidence_min_area,
-                                max_area=cfg.local_evidence_max_area,
-                                bbox_padding=cfg.local_evidence_bbox_padding,
-                                cam_type=cfg.local_evidence_cam_type,
-                            )
-                            if clean_part_batch['num_valid'] > 0 and clean_part_batch['x_part'].numel() > 0:
-                                # C1/D3 共用局部图和 evidence gate；D3 不另算自己的 gate。
-                                use_c1_gate = cfg.part_ce_gate or (
-                                    cfg.local_margin and cfg.local_margin_require_c1_gate
-                                )
-                                if use_c1_gate:
-                                    if (epoch + 1) >= cfg.part_ce_gate_start_epoch:
-                                        gate_mask, gate_threshold = build_gate_mask(
-                                            clean_part_batch['evidence_score'],
-                                            gate_type=cfg.part_ce_gate_type,
-                                            threshold=cfg.part_ce_gate_threshold,
-                                            keep_ratio=cfg.part_ce_gate_keep_ratio,
-                                        )
-                                    else:
-                                        gate_mask = torch.zeros(
-                                            clean_part_batch['num_valid'],
-                                            device=x1.device,
-                                            dtype=torch.bool,
-                                        )
-                                        gate_threshold = clean_part_batch['evidence_score'].new_tensor(0.0)
-                                else:
-                                    gate_mask = torch.ones(
-                                        clean_part_batch['num_valid'],
-                                        device=x1.device,
-                                        dtype=torch.bool,
+                    if clean_part_batch['num_valid'] > 0 and 'gate_mask' in clean_part_batch:
+                        gate_mask = clean_part_batch['gate_mask'].to(device=x1.device, dtype=torch.bool)
+                        num_gated = int(gate_mask.sum().item())
+                        run_part_ce_loss = cfg.part_ce
+                        run_local_margin_loss = cfg.local_margin and (epoch + 1) >= cfg.local_margin_start_epoch
+                        if num_gated > 1 and (run_part_ce_loss or run_local_margin_loss):
+                            # C1/D3 仍只让实际通过 gate 的局部图进入 student 训练前向。
+                            student_was_training = q_model.training
+                            q_model.train()
+                            try:
+                                logits_part = q_model(clean_part_batch['x_part'][gate_mask])[0]
+                                labels_part = clean_part_batch['labels'][gate_mask]
+                                if run_part_ce_loss:
+                                    part_ce_loss = F.cross_entropy(logits_part, labels_part)
+                                    loss = loss + cfg.part_ce_weight * part_ce_loss
+                                if run_local_margin_loss:
+                                    local_margin_result = compute_local_margin_loss(
+                                        logits_part, labels_part,
+                                        margin=cfg.local_margin_margin,
+                                        hard_negative=cfg.local_margin_hard_negative,
+                                        use_logits=cfg.local_margin_use_logits,
                                     )
-                                    gate_threshold = clean_part_batch['evidence_score'].new_tensor(0.0)
-                                clean_part_batch['gate_mask'] = gate_mask
-                                clean_part_batch['gate_threshold'] = gate_threshold
-                                clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
-
-                                num_gated = int(gate_mask.sum().item())
-                                run_part_ce_loss = cfg.part_ce
-                                run_local_margin_loss = cfg.local_margin and (epoch + 1) >= cfg.local_margin_start_epoch
-                                if num_gated > 1 and (run_part_ce_loss or run_local_margin_loss):
-                                    # 只有实际通过 C1 gate 的局部图进入 student 前向和辅助 loss 反传。
-                                    student_was_training = q_model.training
-                                    q_model.train()
-                                    try:
-                                        logits_part = q_model(clean_part_batch['x_part'][gate_mask])[0]
-                                        labels_part = clean_part_batch['labels'][gate_mask]
-                                        if run_part_ce_loss:
-                                            part_ce_loss = F.cross_entropy(logits_part, labels_part)
-                                            loss = loss + cfg.part_ce_weight * part_ce_loss
-                                        if run_local_margin_loss:
-                                            local_margin_result = compute_local_margin_loss(
-                                                logits_part, labels_part,
-                                                margin=cfg.local_margin_margin,
-                                                hard_negative=cfg.local_margin_hard_negative,
-                                                use_logits=cfg.local_margin_use_logits,
-                                            )
-                                            local_margin_loss = local_margin_result['loss']
-                                            loss = loss + cfg.local_margin_weight * local_margin_loss
-                                            clean_part_batch['local_margin_mask'] = gate_mask.detach().clone()
-                                    finally:
-                                        if not student_was_training:
-                                            q_model.eval()
-                                elif num_gated == 1:
-                                    # 单样本会触发 BatchNorm1d 训练模式约束，跳过并清空实际 gate。
-                                    clean_part_batch['gate_mask'] = torch.zeros_like(gate_mask)
-                                    clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
-                        if clean_part_batch['num_valid'] > 0 and 'gate_mask' in clean_part_batch:
-                            # D2_diag/D3 只使用 C1 最终实际 gate，num_gated==1 被清空后不会进入 eligible 子集。
-                            c1_gate_batch_mask[clean_part_batch['batch_indices']] = clean_part_batch['gate_mask'].to(
-                                device=x1.device,
-                                dtype=torch.bool,
-                            )
-                        if part_ce_writer is not None:
-                            part_ce_row = build_part_ce_log_row(
-                                epoch + 1, it, clean_part_group, clean_part_batch,
-                                josnc_loss, part_ce_loss, cfg.part_ce_weight
-                            )
-                            part_ce_writer.write(format_part_ce_row(part_ce_row))
-                        if part_ce_gate_sample_writer is not None and clean_part_batch['num_valid'] > 0:
-                            # C1 逐样本 gate 日志记录实际参与 CE 的 gate，用于后续分析长期过滤样本。
-                            gate_sample_rows = build_part_ce_gate_sample_rows(
-                                epoch + 1, it, clean_part_group, clean_part_batch, indices,
-                                student_logits=logits1,
-                            )
-                            for row in gate_sample_rows:
-                                part_ce_gate_sample_writer.write(format_part_ce_gate_sample_row(row))
-                        if local_margin_writer is not None:
-                            local_margin_row = build_local_margin_log_row(
-                                epoch + 1, it, clean_part_group, clean_part_batch,
-                                loss, local_margin_result, cfg.local_margin_weight,
-                            )
-                            local_margin_writer.write(format_local_margin_row(local_margin_row))
+                                    local_margin_loss = local_margin_result['loss']
+                                    loss = loss + cfg.local_margin_weight * local_margin_loss
+                                    clean_part_batch['local_margin_mask'] = gate_mask.detach().clone()
+                            finally:
+                                if not student_was_training:
+                                    q_model.eval()
+                        elif num_gated == 1 and (run_part_ce_loss or run_local_margin_loss):
+                            # 单样本会触发 BatchNorm1d 训练模式约束，C1/D3 跳过；E1 的 evidence gate 另存不受影响。
+                            clean_part_batch['gate_mask'] = torch.zeros_like(gate_mask)
+                            clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
+                        # D2_diag 只使用 C1/D3 最终实际训练 gate；E1 日志读取 evidence_gate_mask。
+                        c1_gate_batch_mask[clean_part_batch['batch_indices']] = clean_part_batch['gate_mask'].to(
+                            device=x1.device,
+                            dtype=torch.bool,
+                        )
+                    if evidence_clean_reweight_writer is not None:
+                        evidence_row = build_evidence_clean_reweight_log_row(
+                            epoch + 1, it, clean_part_batch,
+                            raw_clean_losses, clean_loss_weight, evidence_clean_context,
+                            high_weight=cfg.evidence_clean_high_weight,
+                            low_weight=cfg.evidence_clean_low_weight,
+                            num_id=int(idx_id.numel()),
+                            num_ood=int(idx_ood.numel()),
+                        )
+                        evidence_clean_reweight_writer.write(format_evidence_clean_reweight_row(evidence_row))
+                    if part_ce_writer is not None:
+                        part_ce_row = build_part_ce_log_row(
+                            epoch + 1, it, clean_part_group, clean_part_batch,
+                            josnc_loss, part_ce_loss, cfg.part_ce_weight
+                        )
+                        part_ce_writer.write(format_part_ce_row(part_ce_row))
+                    if part_ce_gate_sample_writer is not None and clean_part_batch['num_valid'] > 0:
+                        # C1 逐样本 gate 日志记录实际参与 CE 的 gate，用于后续分析长期过滤样本。
+                        gate_sample_rows = build_part_ce_gate_sample_rows(
+                            epoch + 1, it, clean_part_group, clean_part_batch, indices,
+                            student_logits=logits1,
+                        )
+                        for row in gate_sample_rows:
+                            part_ce_gate_sample_writer.write(format_part_ce_gate_sample_row(row))
+                    if local_margin_writer is not None:
+                        local_margin_row = build_local_margin_log_row(
+                            epoch + 1, it, clean_part_group, clean_part_batch,
+                            loss, local_margin_result, cfg.local_margin_weight,
+                        )
+                        local_margin_writer.write(format_local_margin_row(local_margin_row))
 
                     if cfg.id_candidate:
                         id_candidate_loss = loss.new_tensor(0.0)
@@ -1226,6 +1289,10 @@ def check_args(args):
         'local_margin', 'local_margin_groups', 'local_margin_require_c1_gate',
         'local_margin_start_epoch', 'local_margin_weight', 'local_margin_margin',
         'local_margin_hard_negative', 'local_margin_use_logits', 'local_margin_log',
+        'evidence_clean_reweight', 'evidence_clean_reweight_start_epoch',
+        'evidence_clean_reweight_groups', 'evidence_clean_reweight_type',
+        'evidence_clean_high_weight', 'evidence_clean_low_weight',
+        'evidence_clean_use_c1_gate', 'evidence_clean_reweight_log',
         'id_candidate', 'id_candidate_weight', 'id_candidate_topk',
         'id_candidate_start_epoch', 'id_candidate_log',
         'id_candidate_cam_target', 'id_candidate_score_type',
@@ -1386,6 +1453,24 @@ def parse_args():
                         help='D3 是否使用 logits margin；第一版必须为 true。')
     parser.add_argument('--local-margin-log', action=argparse.BooleanOptionalAction, default=None,
                         help='是否写出 local_margin.csv 诊断日志。')
+
+    # E1 evidence-aware clean reweight：用 C1 evidence gate 调整原图 clean CE 权重。
+    parser.add_argument('--evidence-clean-reweight', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 E1 clean 原图 CE evidence reweight。')
+    parser.add_argument('--evidence-clean-reweight-start-epoch', type=int, default=None,
+                        help='从第几个用户可见 epoch 开始启用 E1 clean loss 调权。')
+    parser.add_argument('--evidence-clean-reweight-groups', type=str, default=None,
+                        help='E1 调权分组；第一版只支持 clean。')
+    parser.add_argument('--evidence-clean-reweight-type', type=str, default=None,
+                        help='E1 调权方式；第一版只支持 binary。')
+    parser.add_argument('--evidence-clean-high-weight', type=float, default=None,
+                        help='E1 high-evidence clean 样本的 clean CE 权重。')
+    parser.add_argument('--evidence-clean-low-weight', type=float, default=None,
+                        help='E1 low-evidence clean 样本的 clean CE 权重。')
+    parser.add_argument('--evidence-clean-use-c1-gate', action=argparse.BooleanOptionalAction, default=None,
+                        help='E1 是否复用 C1 actual evidence gate。')
+    parser.add_argument('--evidence-clean-reweight-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 evidence_clean_reweight.csv 诊断日志。')
 
     # C2 ID noisy 候选标签：使用 teacher-top1 单 CAM 构造候选集合，再按配置选择 PLL 或 capped soft target。
     parser.add_argument('--id-candidate', action=argparse.BooleanOptionalAction, default=None,
@@ -1567,6 +1652,15 @@ def parse_args():
     args.setdefault('local_margin_hard_negative', 'max_non_target')
     args.setdefault('local_margin_use_logits', True)
     args.setdefault('local_margin_log', True)
+    # E1 默认关闭；开启后只改 clean 原图 CE 样本权重，不额外添加 loss。
+    args.setdefault('evidence_clean_reweight', False)
+    args.setdefault('evidence_clean_reweight_start_epoch', 20)
+    args.setdefault('evidence_clean_reweight_groups', 'clean')
+    args.setdefault('evidence_clean_reweight_type', 'binary')
+    args.setdefault('evidence_clean_high_weight', 1.0)
+    args.setdefault('evidence_clean_low_weight', 0.5)
+    args.setdefault('evidence_clean_use_c1_gate', True)
+    args.setdefault('evidence_clean_reweight_log', True)
     # C2 默认关闭；启用后可在 PLL、熵约束、capped soft target 和 v4 衰减过滤间组合。
     args.setdefault('id_candidate', False)
     args.setdefault('id_candidate_weight', 0.3)
@@ -1624,6 +1718,8 @@ def parse_args():
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
     args['local_margin_groups'] = str(args['local_margin_groups']).strip().lower()
     args['local_margin_hard_negative'] = str(args['local_margin_hard_negative']).strip().lower()
+    args['evidence_clean_reweight_groups'] = str(args['evidence_clean_reweight_groups']).strip().lower()
+    args['evidence_clean_reweight_type'] = str(args['evidence_clean_reweight_type']).strip().lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()
     args['id_candidate_score_type'] = str(args['id_candidate_score_type']).lower()
     args['id_candidate_loss_type'] = str(args['id_candidate_loss_type']).lower()

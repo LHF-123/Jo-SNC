@@ -41,6 +41,16 @@ LOCAL_MARGIN_CSV_HEADER = (
     'hardneg_class_eq_pred_ratio'
 )
 
+EVIDENCE_CLEAN_REWEIGHT_CSV_HEADER = (
+    'epoch,batch_idx,num_clean,num_valid,num_invalid,num_high,num_low,'
+    'valid_clean_ratio,invalid_ratio,high_ratio_valid,low_ratio_valid,'
+    'high_weight,low_weight,clean_weight_mean,raw_clean_loss_mean,'
+    'weighted_clean_loss_mean,loss_reduction_ratio,high_raw_clean_loss_mean,'
+    'low_raw_clean_loss_mean,invalid_raw_clean_loss_mean,evidence_score_mean,'
+    'high_evidence_score_mean,low_evidence_score_mean,p_part_y_high_mean,'
+    'p_part_y_low_mean,erase_drop_high_mean,erase_drop_low_mean,num_id,num_ood'
+)
+
 ID_CANDIDATE_CSV_HEADER = (
     'epoch,batch_idx,num_selected,num_valid,id_candidate_loss,'
     'id_candidate_weight,weighted_id_candidate_loss,loss_ratio,'
@@ -154,6 +164,30 @@ def format_local_margin_row(row):
         f"{row['part_margin_p50']:.6f},{row['part_margin_p75']:.6f},"
         f"{row['part_margin_violate_ratio']:.6f},"
         f"{row['hardneg_class_eq_pred_ratio']:.6f}"
+    )
+
+
+def format_evidence_clean_reweight_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['num_clean']},"
+        f"{row['num_valid']},{row['num_invalid']},{row['num_high']},"
+        f"{row['num_low']},{row['valid_clean_ratio']:.6f},"
+        f"{row['invalid_ratio']:.6f},{row['high_ratio_valid']:.6f},"
+        f"{row['low_ratio_valid']:.6f},{row['high_weight']:.6f},"
+        f"{row['low_weight']:.6f},{row['clean_weight_mean']:.6f},"
+        f"{row['raw_clean_loss_mean']:.6f},{row['weighted_clean_loss_mean']:.6f},"
+        f"{row['loss_reduction_ratio']:.6f},"
+        f"{row['high_raw_clean_loss_mean']:.6f},"
+        f"{row['low_raw_clean_loss_mean']:.6f},"
+        f"{row['invalid_raw_clean_loss_mean']:.6f},"
+        f"{row['evidence_score_mean']:.6f},"
+        f"{row['high_evidence_score_mean']:.6f},"
+        f"{row['low_evidence_score_mean']:.6f},"
+        f"{row['p_part_y_high_mean']:.6f},"
+        f"{row['p_part_y_low_mean']:.6f},"
+        f"{row['erase_drop_high_mean']:.6f},"
+        f"{row['erase_drop_low_mean']:.6f},"
+        f"{row['num_id']},{row['num_ood']}"
     )
 
 
@@ -1084,6 +1118,125 @@ def compute_local_margin_loss(logits_part, labels, margin=0.5,
     }
 
 
+def build_evidence_clean_weights(idx_clean, part_batch, clean_losses,
+                                 high_weight=1.0, low_weight=0.5,
+                                 batch_size=None):
+    device = clean_losses.device
+    num_clean = int(clean_losses.numel())
+    weights = torch.ones_like(clean_losses)
+    valid_clean_mask = torch.zeros(num_clean, device=device, dtype=torch.bool)
+    high_clean_mask = torch.zeros(num_clean, device=device, dtype=torch.bool)
+    low_clean_mask = torch.zeros(num_clean, device=device, dtype=torch.bool)
+
+    if num_clean == 0:
+        return weights, _evidence_clean_context(
+            valid_clean_mask, high_clean_mask, low_clean_mask
+        )
+
+    gate_mask = part_batch.get('evidence_gate_mask', part_batch.get('gate_mask'))
+    if part_batch.get('num_valid', 0) <= 0 or gate_mask is None:
+        return weights, _evidence_clean_context(
+            valid_clean_mask, high_clean_mask, low_clean_mask
+        )
+
+    if batch_size is None:
+        batch_size = int(idx_clean.detach().max().item()) + 1 if idx_clean.numel() > 0 else num_clean
+
+    idx_clean = idx_clean.detach().to(device=device, dtype=torch.long)
+    batch_indices = part_batch['batch_indices'].detach().to(device=device, dtype=torch.long)
+    gate_mask = gate_mask.detach().to(device=device, dtype=torch.bool)
+    batch_to_clean_pos = torch.full((int(batch_size),), -1, device=device, dtype=torch.long)
+    batch_to_clean_pos[idx_clean] = torch.arange(num_clean, device=device, dtype=torch.long)
+    clean_pos = batch_to_clean_pos[batch_indices]
+    valid_pos_mask = clean_pos >= 0
+    if valid_pos_mask.sum().item() == 0:
+        return weights, _evidence_clean_context(
+            valid_clean_mask, high_clean_mask, low_clean_mask
+        )
+
+    # E1 只在 valid clean part 内按 C1 actual gate 区分 high/low，invalid clean 保持权重 1。
+    clean_pos = clean_pos[valid_pos_mask]
+    gate_mask = gate_mask[valid_pos_mask]
+    valid_clean_mask[clean_pos] = True
+    high_clean_mask[clean_pos[gate_mask]] = True
+    low_clean_mask[clean_pos[~gate_mask]] = True
+    high_values = weights.new_full((clean_pos.numel(),), float(high_weight))
+    low_values = weights.new_full((clean_pos.numel(),), float(low_weight))
+    weights[clean_pos] = torch.where(gate_mask, high_values, low_values)
+    return weights, _evidence_clean_context(
+        valid_clean_mask, high_clean_mask, low_clean_mask
+    )
+
+
+def build_evidence_clean_reweight_log_row(
+        epoch, batch_idx, part_batch, raw_clean_losses, clean_weights,
+        context, high_weight=1.0, low_weight=0.5, num_id=0, num_ood=0):
+    raw_clean_losses = raw_clean_losses.detach()
+    clean_weights = clean_weights.detach()
+    weighted_losses = raw_clean_losses * clean_weights
+    num_clean = int(raw_clean_losses.numel())
+    if context is None:
+        empty_mask = torch.zeros(num_clean, device=raw_clean_losses.device, dtype=torch.bool)
+        context = _evidence_clean_context(empty_mask, empty_mask, empty_mask)
+
+    valid_mask = context['valid_clean_mask'].to(device=raw_clean_losses.device, dtype=torch.bool)
+    high_mask = context['high_clean_mask'].to(device=raw_clean_losses.device, dtype=torch.bool)
+    low_mask = context['low_clean_mask'].to(device=raw_clean_losses.device, dtype=torch.bool)
+    invalid_mask = context['invalid_clean_mask'].to(device=raw_clean_losses.device, dtype=torch.bool)
+    num_valid = int(valid_mask.sum().item())
+    num_high = int(high_mask.sum().item())
+    num_low = int(low_mask.sum().item())
+    num_invalid = int(invalid_mask.sum().item())
+    gate_mask = part_batch.get('evidence_gate_mask', part_batch.get('gate_mask'))
+
+    if part_batch.get('num_valid', 0) > 0 and gate_mask is not None:
+        gate_mask = gate_mask.detach().to(device=part_batch['evidence_score'].device, dtype=torch.bool)
+        low_part_mask = gate_mask.logical_not()
+        evidence_score = part_batch['evidence_score'].detach()
+        p_part_y = part_batch['p_part_y'].detach()
+        erase_drop = part_batch['erase_drop'].detach()
+    else:
+        gate_mask = None
+        low_part_mask = None
+        evidence_score = raw_clean_losses.new_zeros((0,))
+        p_part_y = raw_clean_losses.new_zeros((0,))
+        erase_drop = raw_clean_losses.new_zeros((0,))
+
+    raw_mean = _mean_or_zero(raw_clean_losses)
+    weighted_mean = _mean_or_zero(weighted_losses)
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'num_clean': num_clean,
+        'num_valid': num_valid,
+        'num_invalid': num_invalid,
+        'num_high': num_high,
+        'num_low': num_low,
+        'valid_clean_ratio': float(num_valid / max(num_clean, 1)),
+        'invalid_ratio': float(num_invalid / max(num_clean, 1)),
+        'high_ratio_valid': float(num_high / max(num_valid, 1)),
+        'low_ratio_valid': float(num_low / max(num_valid, 1)),
+        'high_weight': float(high_weight),
+        'low_weight': float(low_weight),
+        'clean_weight_mean': _mean_or_zero(clean_weights),
+        'raw_clean_loss_mean': raw_mean,
+        'weighted_clean_loss_mean': weighted_mean,
+        'loss_reduction_ratio': float(weighted_mean / max(abs(raw_mean), 1e-12)),
+        'high_raw_clean_loss_mean': _mean_or_zero(raw_clean_losses[high_mask]),
+        'low_raw_clean_loss_mean': _mean_or_zero(raw_clean_losses[low_mask]),
+        'invalid_raw_clean_loss_mean': _mean_or_zero(raw_clean_losses[invalid_mask]),
+        'evidence_score_mean': _mean_or_zero(evidence_score),
+        'high_evidence_score_mean': _mean_or_zero(evidence_score[gate_mask]) if gate_mask is not None else 0.0,
+        'low_evidence_score_mean': _mean_or_zero(evidence_score[low_part_mask]) if low_part_mask is not None else 0.0,
+        'p_part_y_high_mean': _mean_or_zero(p_part_y[gate_mask]) if gate_mask is not None else 0.0,
+        'p_part_y_low_mean': _mean_or_zero(p_part_y[low_part_mask]) if low_part_mask is not None else 0.0,
+        'erase_drop_high_mean': _mean_or_zero(erase_drop[gate_mask]) if gate_mask is not None else 0.0,
+        'erase_drop_low_mean': _mean_or_zero(erase_drop[low_part_mask]) if low_part_mask is not None else 0.0,
+        'num_id': int(num_id),
+        'num_ood': int(num_ood),
+    }
+
+
 def compute_id_candidate_pll_loss(logits, candidate_mask, entropy_weight=0.0, entropy_min_ratio=0.0):
     result = compute_id_candidate_loss(
         logits, candidate_mask,
@@ -1886,6 +2039,16 @@ def _empty_local_margin_log_row(epoch, batch_idx, group, num_selected, num_valid
         'part_margin_p75': 0.0,
         'part_margin_violate_ratio': 0.0,
         'hardneg_class_eq_pred_ratio': 0.0,
+    }
+
+
+def _evidence_clean_context(valid_clean_mask, high_clean_mask, low_clean_mask):
+    invalid_clean_mask = valid_clean_mask.logical_not()
+    return {
+        'valid_clean_mask': valid_clean_mask,
+        'high_clean_mask': high_clean_mask,
+        'low_clean_mask': low_clean_mask,
+        'invalid_clean_mask': invalid_clean_mask,
     }
 
 
