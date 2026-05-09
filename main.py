@@ -44,6 +44,7 @@ from utils.local_evidence import (
     LOCAL_MARGIN_CSV_HEADER,
     MULTI_PART_CSV_HEADER,
     MULTI_PART_SAMPLE_CSV_HEADER,
+    PART_CONSISTENCY_CSV_HEADER,
     PART_CE_GATE_SAMPLE_CSV_HEADER,
     PART_CE_CSV_HEADER,
     attach_id_candidate_loss_results,
@@ -55,6 +56,7 @@ from utils.local_evidence import (
     build_gate_mask,
     build_local_part_batch,
     build_local_margin_log_row,
+    build_part_consistency_log_row,
     build_part_ce_gate_sample_rows,
     build_part_ce_log_row,
     compute_id_candidate_effective_weight,
@@ -63,6 +65,7 @@ from utils.local_evidence import (
     compute_local_evidence,
     compute_local_margin_loss,
     compute_multi_part_evidence,
+    compute_part_consistency_loss,
     format_d2_diag_row,
     format_d2_diag_sample_row,
     format_evidence_clean_reweight_row,
@@ -72,6 +75,7 @@ from utils.local_evidence import (
     format_local_margin_row,
     format_multi_part_row,
     format_multi_part_sample_row,
+    format_part_consistency_row,
     format_part_ce_gate_sample_row,
     format_part_ce_row,
 )
@@ -412,6 +416,32 @@ def main(gpu, cfg):
             raise ValueError('D3 local_margin first version requires local_margin_use_logits=true.')
         if cfg.local_margin_require_c1_gate and not cfg.part_ce_gate:
             raise ValueError('D3 local_margin requires part_ce_gate=true when local_margin_require_c1_gate=true.')
+    if cfg.part_consistency:
+        if cfg.part_consistency_groups != 'clean':
+            raise ValueError(
+                f'F1 part_consistency currently supports clean only, got {cfg.part_consistency_groups}.'
+            )
+        if cfg.part_consistency_type != 'kl_global_to_part':
+            raise ValueError(
+                f'part_consistency_type should be kl_global_to_part, got {cfg.part_consistency_type}.'
+            )
+        if not cfg.part_consistency_require_c1_gate:
+            raise ValueError('F1 first version requires part_consistency_require_c1_gate=true.')
+        if cfg.part_consistency_require_c1_gate and not cfg.part_ce_gate:
+            raise ValueError('F1 requires part_ce_gate=true when part_consistency_require_c1_gate=true.')
+        if not cfg.part_consistency_stopgrad_global:
+            raise ValueError('F1 first version requires part_consistency_stopgrad_global=true.')
+        if cfg.part_consistency_start_epoch < 0:
+            raise ValueError('part_consistency_start_epoch should be non-negative.')
+        if cfg.part_consistency_weight < 0.0:
+            raise ValueError('part_consistency_weight should be non-negative.')
+        if cfg.part_consistency_temp <= 0.0:
+            raise ValueError('part_consistency_temp should be positive.')
+        if cfg.part_ce or cfg.local_margin or cfg.evidence_clean_reweight or cfg.id_candidate or cfg.multi_part or cfg.d2_diag:
+            raise ValueError(
+                'F1 first version should run alone: disable part_ce/local_margin/'
+                'evidence_clean_reweight/id_candidate/multi_part/d2_diag.'
+            )
     if cfg.evidence_clean_reweight:
         if cfg.evidence_clean_reweight_groups != 'clean':
             raise ValueError(
@@ -535,6 +565,14 @@ def main(gpu, cfg):
     if cfg.local_margin and cfg.local_margin_log:
         # D3 单独写 margin 诊断，避免和 C1 CE 日志混淆 loss 强度。
         local_margin_writer = Writer(root_dir=result_dir, filename='local_margin.csv', header=LOCAL_MARGIN_CSV_HEADER)
+    part_consistency_writer = None
+    if cfg.part_consistency and cfg.part_consistency_log:
+        # F1 单独写 global-to-part KL 诊断，避免和 C1 hard-label CE 指标混淆。
+        part_consistency_writer = Writer(
+            root_dir=result_dir,
+            filename='part_consistency.csv',
+            header=PART_CONSISTENCY_CSV_HEADER,
+        )
     evidence_clean_reweight_writer = None
     if cfg.evidence_clean_reweight and cfg.evidence_clean_reweight_log:
         # E1 记录 clean 主 loss 的证据调权强度，不新增局部分支 loss。
@@ -776,6 +814,8 @@ def main(gpu, cfg):
                     clean_part_group = 'clean'
                     part_ce_loss = losses_cls_clean.new_tensor(0.0)
                     local_margin_result = None
+                    part_consistency_result = None
+                    part_consistency_skip_reason = 'disabled'
                     evidence_clean_context = None
                     clean_loss_weight = torch.ones_like(losses_cls_clean)
                     raw_clean_losses = losses_cls_clean.detach()
@@ -785,7 +825,19 @@ def main(gpu, cfg):
                         and (epoch + 1) >= cfg.evidence_clean_reweight_start_epoch
                         and (epoch + 1) >= cfg.part_ce_gate_start_epoch
                     )
-                    need_clean_part_gate = cfg.part_ce or cfg.local_margin or run_evidence_clean_reweight
+                    run_part_consistency = (
+                        cfg.part_consistency
+                        and (epoch + 1) >= cfg.part_consistency_start_epoch
+                        and (epoch + 1) >= cfg.part_ce_gate_start_epoch
+                    )
+                    if cfg.part_consistency:
+                        part_consistency_skip_reason = 'not_started' if not run_part_consistency else 'no_clean'
+                    need_clean_part_gate = (
+                        cfg.part_ce
+                        or cfg.local_margin
+                        or run_evidence_clean_reweight
+                        or run_part_consistency
+                    )
                     if need_clean_part_gate and idx_clean.numel() > 0:
                         cam_model = k_model if cfg.part_ce_use_teacher_cam else q_model
                         clean_part_batch = build_local_part_batch(
@@ -801,6 +853,8 @@ def main(gpu, cfg):
                                 cfg.local_margin and cfg.local_margin_require_c1_gate
                             ) or (
                                 cfg.evidence_clean_reweight and cfg.evidence_clean_use_c1_gate
+                            ) or (
+                                cfg.part_consistency and cfg.part_consistency_require_c1_gate
                             )
                             if use_c1_gate:
                                 if (epoch + 1) >= cfg.part_ce_gate_start_epoch:
@@ -828,6 +882,9 @@ def main(gpu, cfg):
                             clean_part_batch['gate_mask'] = gate_mask
                             clean_part_batch['gate_threshold'] = gate_threshold
                             clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
+                            clean_part_batch['part_consistency_mask'] = torch.zeros_like(gate_mask)
+                        elif run_part_consistency:
+                            part_consistency_skip_reason = 'no_valid_part'
 
                     if run_evidence_clean_reweight:
                         clean_loss_weight, evidence_clean_context = build_evidence_clean_weights(
@@ -872,8 +929,11 @@ def main(gpu, cfg):
                         num_gated = int(gate_mask.sum().item())
                         run_part_ce_loss = cfg.part_ce
                         run_local_margin_loss = cfg.local_margin and (epoch + 1) >= cfg.local_margin_start_epoch
-                        if num_gated > 1 and (run_part_ce_loss or run_local_margin_loss):
-                            # C1/D3 仍只让实际通过 gate 的局部图进入 student 训练前向。
+                        run_part_consistency_loss = run_part_consistency
+                        if run_part_consistency_loss and num_gated == 0:
+                            part_consistency_skip_reason = 'no_c1_gated'
+                        if num_gated > 1 and (run_part_ce_loss or run_local_margin_loss or run_part_consistency_loss):
+                            # C1/D3/F1 仍只让实际通过 gate 的局部图进入 student 训练前向。
                             student_was_training = q_model.training
                             q_model.train()
                             try:
@@ -892,13 +952,32 @@ def main(gpu, cfg):
                                     local_margin_loss = local_margin_result['loss']
                                     loss = loss + cfg.local_margin_weight * local_margin_loss
                                     clean_part_batch['local_margin_mask'] = gate_mask.detach().clone()
+                                if run_part_consistency_loss:
+                                    global_positions = clean_part_batch['batch_indices'][gate_mask]
+                                    if cfg.part_consistency_use_teacher_global:
+                                        logits_global = ema_logits1[global_positions]
+                                    else:
+                                        logits_global = logits1[global_positions].detach()
+                                    part_consistency_result = compute_part_consistency_loss(
+                                        logits_part, logits_global, labels_part,
+                                        temperature=cfg.part_consistency_temp,
+                                        loss_type=cfg.part_consistency_type,
+                                        stopgrad_global=cfg.part_consistency_stopgrad_global,
+                                    )
+                                    loss = loss + cfg.part_consistency_weight * part_consistency_result['loss']
+                                    clean_part_batch['part_consistency_mask'] = gate_mask.detach().clone()
+                                    part_consistency_skip_reason = 'none'
                             finally:
                                 if not student_was_training:
                                     q_model.eval()
-                        elif num_gated == 1 and (run_part_ce_loss or run_local_margin_loss):
-                            # 单样本会触发 BatchNorm1d 训练模式约束，C1/D3 跳过；E1 的 evidence gate 另存不受影响。
-                            clean_part_batch['gate_mask'] = torch.zeros_like(gate_mask)
-                            clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
+                        elif num_gated == 1 and (run_part_ce_loss or run_local_margin_loss or run_part_consistency_loss):
+                            # 单样本会触发 BatchNorm1d 训练模式约束，C1/D3/F1 跳过；E1 的 evidence gate 另存不受影响。
+                            if run_part_consistency_loss:
+                                part_consistency_skip_reason = 'single_sample_bn'
+                                clean_part_batch['part_consistency_mask'] = torch.zeros_like(gate_mask)
+                            if run_part_ce_loss or run_local_margin_loss:
+                                clean_part_batch['gate_mask'] = torch.zeros_like(gate_mask)
+                                clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
                         # D2_diag 只使用 C1/D3 最终实际训练 gate；E1 日志读取 evidence_gate_mask。
                         c1_gate_batch_mask[clean_part_batch['batch_indices']] = clean_part_batch['gate_mask'].to(
                             device=x1.device,
@@ -934,6 +1013,13 @@ def main(gpu, cfg):
                             loss, local_margin_result, cfg.local_margin_weight,
                         )
                         local_margin_writer.write(format_local_margin_row(local_margin_row))
+                    if part_consistency_writer is not None:
+                        part_consistency_row = build_part_consistency_log_row(
+                            epoch + 1, it, clean_part_group, clean_part_batch,
+                            loss, part_consistency_result, cfg.part_consistency_weight,
+                            skip_reason=part_consistency_skip_reason,
+                        )
+                        part_consistency_writer.write(format_part_consistency_row(part_consistency_row))
 
                     if cfg.id_candidate:
                         id_candidate_loss = loss.new_tensor(0.0)
@@ -1289,6 +1375,11 @@ def check_args(args):
         'local_margin', 'local_margin_groups', 'local_margin_require_c1_gate',
         'local_margin_start_epoch', 'local_margin_weight', 'local_margin_margin',
         'local_margin_hard_negative', 'local_margin_use_logits', 'local_margin_log',
+        'part_consistency', 'part_consistency_groups',
+        'part_consistency_require_c1_gate', 'part_consistency_start_epoch',
+        'part_consistency_weight', 'part_consistency_type',
+        'part_consistency_temp', 'part_consistency_use_teacher_global',
+        'part_consistency_stopgrad_global', 'part_consistency_log',
         'evidence_clean_reweight', 'evidence_clean_reweight_start_epoch',
         'evidence_clean_reweight_groups', 'evidence_clean_reweight_type',
         'evidence_clean_high_weight', 'evidence_clean_low_weight',
@@ -1453,6 +1544,28 @@ def parse_args():
                         help='D3 是否使用 logits margin；第一版必须为 true。')
     parser.add_argument('--local-margin-log', action=argparse.BooleanOptionalAction, default=None,
                         help='是否写出 local_margin.csv 诊断日志。')
+
+    # F1 global-to-part consistency：复用 C1 actual gate，用全图 soft target 约束局部图分布。
+    parser.add_argument('--part-consistency', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 F1 global-to-part KL consistency 分支。')
+    parser.add_argument('--part-consistency-groups', type=str, default=None,
+                        help='F1 使用哪些 Jo-SNC 分组；第一版只支持 clean。')
+    parser.add_argument('--part-consistency-require-c1-gate', action=argparse.BooleanOptionalAction, default=None,
+                        help='F1 是否必须复用 C1 actual gate；第一版必须为 true。')
+    parser.add_argument('--part-consistency-start-epoch', type=int, default=None,
+                        help='从第几个用户可见 epoch 开始启用 F1 KL consistency。')
+    parser.add_argument('--part-consistency-weight', type=float, default=None,
+                        help='F1 KL consistency loss 加到总 loss 的权重。')
+    parser.add_argument('--part-consistency-type', type=str, default=None,
+                        help='F1 consistency 类型；第一版只支持 kl_global_to_part。')
+    parser.add_argument('--part-consistency-temp', type=float, default=None,
+                        help='F1 KL consistency 的 softmax temperature。')
+    parser.add_argument('--part-consistency-use-teacher-global', action=argparse.BooleanOptionalAction, default=None,
+                        help='F1 是否使用 EMA teacher 原图 logits 作为 global soft target。')
+    parser.add_argument('--part-consistency-stopgrad-global', action=argparse.BooleanOptionalAction, default=None,
+                        help='F1 是否对 global soft target 停止梯度；第一版必须为 true。')
+    parser.add_argument('--part-consistency-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 part_consistency.csv 诊断日志。')
 
     # E1 evidence-aware clean reweight：用 C1 evidence gate 调整原图 clean CE 权重。
     parser.add_argument('--evidence-clean-reweight', action=argparse.BooleanOptionalAction, default=None,
@@ -1652,6 +1765,17 @@ def parse_args():
     args.setdefault('local_margin_hard_negative', 'max_non_target')
     args.setdefault('local_margin_use_logits', True)
     args.setdefault('local_margin_log', True)
+    # F1 默认关闭；开启后复用 C1 actual gate，用 global soft distribution 蒸馏局部图。
+    args.setdefault('part_consistency', False)
+    args.setdefault('part_consistency_groups', 'clean')
+    args.setdefault('part_consistency_require_c1_gate', True)
+    args.setdefault('part_consistency_start_epoch', 20)
+    args.setdefault('part_consistency_weight', 0.05)
+    args.setdefault('part_consistency_type', 'kl_global_to_part')
+    args.setdefault('part_consistency_temp', 2.0)
+    args.setdefault('part_consistency_use_teacher_global', True)
+    args.setdefault('part_consistency_stopgrad_global', True)
+    args.setdefault('part_consistency_log', True)
     # E1 默认关闭；开启后只改 clean 原图 CE 样本权重，不额外添加 loss。
     args.setdefault('evidence_clean_reweight', False)
     args.setdefault('evidence_clean_reweight_start_epoch', 20)
@@ -1718,6 +1842,8 @@ def parse_args():
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
     args['local_margin_groups'] = str(args['local_margin_groups']).strip().lower()
     args['local_margin_hard_negative'] = str(args['local_margin_hard_negative']).strip().lower()
+    args['part_consistency_groups'] = str(args['part_consistency_groups']).strip().lower()
+    args['part_consistency_type'] = str(args['part_consistency_type']).strip().lower()
     args['evidence_clean_reweight_groups'] = str(args['evidence_clean_reweight_groups']).strip().lower()
     args['evidence_clean_reweight_type'] = str(args['evidence_clean_reweight_type']).strip().lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()

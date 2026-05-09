@@ -41,6 +41,17 @@ LOCAL_MARGIN_CSV_HEADER = (
     'hardneg_class_eq_pred_ratio'
 )
 
+PART_CONSISTENCY_CSV_HEADER = (
+    'epoch,batch_idx,group,num_clean,num_valid_part,num_c1_gated,'
+    'num_consistency_valid,consistency_valid_ratio,part_consistency_loss_raw,'
+    'part_consistency_loss_weighted,part_consistency_loss_ratio,'
+    'global_entropy_mean,part_entropy_mean,global_conf_mean,part_conf_mean,'
+    'kl_global_to_part_mean,global_top1_eq_part_top1_ratio,'
+    'global_pred_eq_label_ratio,part_pred_eq_label_ratio,p_global_y_mean,'
+    'p_part_y_mean,evidence_score_mean,gated_evidence_score_mean,'
+    'filtered_evidence_score_mean,skip_reason'
+)
+
 EVIDENCE_CLEAN_REWEIGHT_CSV_HEADER = (
     'epoch,batch_idx,num_clean,num_valid,num_invalid,num_high,num_low,'
     'valid_clean_ratio,invalid_ratio,high_ratio_valid,low_ratio_valid,'
@@ -164,6 +175,28 @@ def format_local_margin_row(row):
         f"{row['part_margin_p50']:.6f},{row['part_margin_p75']:.6f},"
         f"{row['part_margin_violate_ratio']:.6f},"
         f"{row['hardneg_class_eq_pred_ratio']:.6f}"
+    )
+
+
+def format_part_consistency_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['group']},"
+        f"{row['num_clean']},{row['num_valid_part']},{row['num_c1_gated']},"
+        f"{row['num_consistency_valid']},{row['consistency_valid_ratio']:.6f},"
+        f"{row['part_consistency_loss_raw']:.6f},"
+        f"{row['part_consistency_loss_weighted']:.6f},"
+        f"{row['part_consistency_loss_ratio']:.6f},"
+        f"{row['global_entropy_mean']:.6f},{row['part_entropy_mean']:.6f},"
+        f"{row['global_conf_mean']:.6f},{row['part_conf_mean']:.6f},"
+        f"{row['kl_global_to_part_mean']:.6f},"
+        f"{row['global_top1_eq_part_top1_ratio']:.6f},"
+        f"{row['global_pred_eq_label_ratio']:.6f},"
+        f"{row['part_pred_eq_label_ratio']:.6f},"
+        f"{row['p_global_y_mean']:.6f},{row['p_part_y_mean']:.6f},"
+        f"{row['evidence_score_mean']:.6f},"
+        f"{row['gated_evidence_score_mean']:.6f},"
+        f"{row['filtered_evidence_score_mean']:.6f},"
+        f"{row['skip_reason']}"
     )
 
 
@@ -1118,6 +1151,80 @@ def compute_local_margin_loss(logits_part, labels, margin=0.5,
     }
 
 
+def compute_part_consistency_loss(logits_part, logits_global, labels,
+                                  temperature=2.0, loss_type='kl_global_to_part',
+                                  stopgrad_global=True):
+    loss_type = str(loss_type).lower()
+    if loss_type != 'kl_global_to_part':
+        raise ValueError(f'part_consistency_type only supports kl_global_to_part, got {loss_type}.')
+    if not stopgrad_global:
+        raise ValueError('F1 first version requires part_consistency_stopgrad_global=true.')
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f'part_consistency_temp should be positive, got {temperature}.')
+
+    labels = labels.detach().long()
+    if logits_part.numel() == 0 or logits_global.numel() == 0 or labels.numel() == 0:
+        zero_loss = logits_part.sum() * 0.0
+        empty = logits_part.new_zeros((0,), dtype=torch.float)
+        empty_long = labels.new_zeros((0,), dtype=torch.long)
+        return {
+            'loss': zero_loss,
+            'losses': empty,
+            'global_entropy': empty,
+            'part_entropy': empty,
+            'global_conf': empty,
+            'part_conf': empty,
+            'global_pred': empty_long,
+            'part_pred': empty_long,
+            'p_global_y': empty,
+            'p_part_y': empty,
+            'global_pred_eq_label': empty.to(dtype=torch.bool),
+            'part_pred_eq_label': empty.to(dtype=torch.bool),
+            'top1_eq': empty.to(dtype=torch.bool),
+        }
+
+    if logits_part.size(0) != logits_global.size(0):
+        raise ValueError(
+            f'part/global batch sizes should match, got {logits_part.size(0)} and {logits_global.size(0)}.'
+        )
+    if labels.numel() != logits_part.size(0):
+        raise ValueError(f'labels size should match part logits, got {labels.numel()} and {logits_part.size(0)}.')
+
+    # F1 固定使用 global -> part 蒸馏式 KL；global 端只作为 soft target，不参与反传。
+    part_logits = logits_part.float()
+    global_logits = logits_global.detach().float()
+    p_global_t = F.softmax(global_logits / temperature, dim=1)
+    log_p_part_t = F.log_softmax(part_logits / temperature, dim=1)
+    losses = F.kl_div(log_p_part_t, p_global_t, reduction='none').sum(dim=1) * (temperature * temperature)
+
+    part_probs = F.softmax(part_logits, dim=1)
+    global_probs = F.softmax(global_logits, dim=1)
+    global_conf, global_pred = global_probs.max(dim=1)
+    part_conf, part_pred = part_probs.max(dim=1)
+    label_indices = labels.to(device=part_logits.device, dtype=torch.long).view(-1, 1)
+    p_global_y = global_probs.gather(1, label_indices).squeeze(1)
+    p_part_y = part_probs.gather(1, label_indices).squeeze(1)
+    global_entropy = -(global_probs * global_probs.clamp(min=1e-12).log()).sum(dim=1)
+    part_entropy = -(part_probs * part_probs.clamp(min=1e-12).log()).sum(dim=1)
+
+    return {
+        'loss': losses.mean(),
+        'losses': losses.detach(),
+        'global_entropy': global_entropy.detach(),
+        'part_entropy': part_entropy.detach(),
+        'global_conf': global_conf.detach(),
+        'part_conf': part_conf.detach(),
+        'global_pred': global_pred.detach(),
+        'part_pred': part_pred.detach(),
+        'p_global_y': p_global_y.detach(),
+        'p_part_y': p_part_y.detach(),
+        'global_pred_eq_label': global_pred.detach().eq(labels.to(device=global_pred.device)),
+        'part_pred_eq_label': part_pred.detach().eq(labels.to(device=part_pred.device)),
+        'top1_eq': global_pred.detach().eq(part_pred.detach()),
+    }
+
+
 def build_evidence_clean_weights(idx_clean, part_batch, clean_losses,
                                  high_weight=1.0, low_weight=0.5,
                                  batch_size=None):
@@ -1318,6 +1425,64 @@ def build_local_margin_log_row(epoch, batch_idx, group, part_batch, total_loss,
         'part_margin_p75': _quantile_or_zero(part_margin, 0.75),
         'part_margin_violate_ratio': _mean_or_zero(violate_mask),
         'hardneg_class_eq_pred_ratio': _mean_or_zero(hardneg_eq_pred),
+    }
+
+
+def build_part_consistency_log_row(epoch, batch_idx, group, part_batch, total_loss,
+                                   consistency_result, part_consistency_weight,
+                                   skip_reason=''):
+    num_clean = int(part_batch.get('num_selected', 0))
+    num_valid_part = int(part_batch.get('num_valid', 0))
+    gate_mask = _part_batch_gate_mask(part_batch)
+    num_c1_gated = int(gate_mask.sum().item()) if gate_mask is not None else 0
+
+    if consistency_result is None:
+        return _empty_part_consistency_log_row(
+            epoch, batch_idx, group, num_clean, num_valid_part,
+            num_c1_gated, part_batch, skip_reason or 'not_run'
+        )
+
+    losses = consistency_result['losses'].detach()
+    num_consistency_valid = int(losses.numel())
+    if num_consistency_valid == 0:
+        return _empty_part_consistency_log_row(
+            epoch, batch_idx, group, num_clean, num_valid_part,
+            num_c1_gated, part_batch, skip_reason or 'empty_loss'
+        )
+
+    raw_loss = float(consistency_result['loss'].detach().item())
+    weighted_loss = float(part_consistency_weight) * raw_loss
+    total_loss_value = float(total_loss.detach().item())
+    # F1 日志用加权 KL 占当前 total loss 的比例判断局部一致性约束是否过强。
+    loss_ratio = weighted_loss / max(abs(total_loss_value), 1e-12)
+    evidence_stats = _part_consistency_evidence_stats(part_batch, gate_mask)
+
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'num_clean': num_clean,
+        'num_valid_part': num_valid_part,
+        'num_c1_gated': num_c1_gated,
+        'num_consistency_valid': num_consistency_valid,
+        'consistency_valid_ratio': float(num_consistency_valid / max(num_valid_part, 1)),
+        'part_consistency_loss_raw': raw_loss,
+        'part_consistency_loss_weighted': weighted_loss,
+        'part_consistency_loss_ratio': loss_ratio,
+        'global_entropy_mean': _mean_or_zero(consistency_result['global_entropy']),
+        'part_entropy_mean': _mean_or_zero(consistency_result['part_entropy']),
+        'global_conf_mean': _mean_or_zero(consistency_result['global_conf']),
+        'part_conf_mean': _mean_or_zero(consistency_result['part_conf']),
+        'kl_global_to_part_mean': _mean_or_zero(losses),
+        'global_top1_eq_part_top1_ratio': _mean_or_zero(consistency_result['top1_eq'].float()),
+        'global_pred_eq_label_ratio': _mean_or_zero(consistency_result['global_pred_eq_label'].float()),
+        'part_pred_eq_label_ratio': _mean_or_zero(consistency_result['part_pred_eq_label'].float()),
+        'p_global_y_mean': _mean_or_zero(consistency_result['p_global_y']),
+        'p_part_y_mean': _mean_or_zero(consistency_result['p_part_y']),
+        'evidence_score_mean': evidence_stats['evidence_score_mean'],
+        'gated_evidence_score_mean': evidence_stats['gated_evidence_score_mean'],
+        'filtered_evidence_score_mean': evidence_stats['filtered_evidence_score_mean'],
+        'skip_reason': skip_reason or 'none',
     }
 
 
@@ -2042,6 +2207,42 @@ def _empty_local_margin_log_row(epoch, batch_idx, group, num_selected, num_valid
     }
 
 
+def _empty_part_consistency_log_row(epoch, batch_idx, group, num_clean,
+                                    num_valid_part, num_c1_gated, part_batch,
+                                    skip_reason):
+    gate_mask = _part_batch_gate_mask(part_batch)
+    evidence_stats = _part_consistency_evidence_stats(part_batch, gate_mask)
+    # F1 单样本跳过时保留 eligible 计数，便于确认是 BN 约束而不是 gate 没选中样本。
+    num_consistency_valid = int(num_c1_gated) if skip_reason == 'single_sample_bn' else 0
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'num_clean': int(num_clean),
+        'num_valid_part': int(num_valid_part),
+        'num_c1_gated': int(num_c1_gated),
+        'num_consistency_valid': num_consistency_valid,
+        'consistency_valid_ratio': float(num_consistency_valid / max(int(num_valid_part), 1)),
+        'part_consistency_loss_raw': 0.0,
+        'part_consistency_loss_weighted': 0.0,
+        'part_consistency_loss_ratio': 0.0,
+        'global_entropy_mean': 0.0,
+        'part_entropy_mean': 0.0,
+        'global_conf_mean': 0.0,
+        'part_conf_mean': 0.0,
+        'kl_global_to_part_mean': 0.0,
+        'global_top1_eq_part_top1_ratio': 0.0,
+        'global_pred_eq_label_ratio': 0.0,
+        'part_pred_eq_label_ratio': 0.0,
+        'p_global_y_mean': 0.0,
+        'p_part_y_mean': 0.0,
+        'evidence_score_mean': evidence_stats['evidence_score_mean'],
+        'gated_evidence_score_mean': evidence_stats['gated_evidence_score_mean'],
+        'filtered_evidence_score_mean': evidence_stats['filtered_evidence_score_mean'],
+        'skip_reason': skip_reason,
+    }
+
+
 def _evidence_clean_context(valid_clean_mask, high_clean_mask, low_clean_mask):
     invalid_clean_mask = valid_clean_mask.logical_not()
     return {
@@ -2117,6 +2318,45 @@ def _mean_or_zero(values):
     if values.numel() == 0:
         return 0.0
     return float(values.detach().mean().item())
+
+
+def _part_batch_gate_mask(part_batch):
+    if part_batch is None or part_batch.get('num_valid', 0) <= 0:
+        return None
+    gate_mask = part_batch.get('gate_mask')
+    if gate_mask is None:
+        evidence_score = part_batch.get('evidence_score')
+        if evidence_score is None:
+            return None
+        return torch.ones(
+            int(part_batch['num_valid']),
+            device=evidence_score.device,
+            dtype=torch.bool,
+        )
+    return gate_mask.detach().to(dtype=torch.bool)
+
+
+def _part_consistency_evidence_stats(part_batch, gate_mask):
+    stats = {
+        'evidence_score_mean': 0.0,
+        'gated_evidence_score_mean': 0.0,
+        'filtered_evidence_score_mean': 0.0,
+    }
+    if part_batch is None or part_batch.get('num_valid', 0) <= 0:
+        return stats
+    evidence_score = part_batch.get('evidence_score')
+    if evidence_score is None or evidence_score.numel() == 0:
+        return stats
+    evidence_score = evidence_score.detach()
+    if gate_mask is None:
+        gate_mask = torch.ones(evidence_score.numel(), device=evidence_score.device, dtype=torch.bool)
+    else:
+        gate_mask = gate_mask.to(device=evidence_score.device, dtype=torch.bool)
+    filtered_mask = gate_mask.logical_not()
+    stats['evidence_score_mean'] = _mean_or_zero(evidence_score)
+    stats['gated_evidence_score_mean'] = _mean_or_zero(evidence_score[gate_mask])
+    stats['filtered_evidence_score_mean'] = _mean_or_zero(evidence_score[filtered_mask])
+    return stats
 
 
 def _quantile_or_zero(values, quantile):
