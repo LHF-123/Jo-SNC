@@ -1,0 +1,98 @@
+# 训练集前向诊断专用配置
+# 用法：配合 scripts/bg_diag.py 和 C1 checkpoint，只做前向，不训练。
+
+# dataset
+data_root: /root/autodl-tmp/
+dataset: web-bird
+n_classes: 200
+rescale_size: 448
+crop_size: 448
+
+# network
+arch: resnet50
+fdim: 256
+hdim: 2
+
+# 诊断脚本只依赖数据集与模型结构，这里保留和 C1 一致的基础字段，
+# 方便直接复用同一个 checkpoint 做前向分析。
+opt: sgd
+batch_size: 56
+epochs: 120
+lr: 0.00875
+lr_decay: cosine:10
+warmup_epochs: 5
+warmup_lr: 0.00875
+warmup_lr_plan: constant
+weight_decay: 1.0e-5
+use_fp16: true
+
+# Jo-SNC 基础超参数
+eps: 0.3
+alpha: 0.3
+beta: 0.8
+gamma: 0.001
+delta: 0.0
+queue_length: 32000
+knet_m: 0.99
+n_neighbors: 10
+topK: 10
+topK_decay: 1000
+tau_m: 0.98
+transform: strong
+cls4ood: nl
+cls4id: ce
+ncr_lossfunc: kldiv
+integrate_mode: or
+ood_criterion: div
+threshold_generator: per_class_mean
+conf_weight: true
+
+# C1 相关字段保留为 false，避免训练侧分支干扰诊断语义。
+local_evidence: false
+local_evidence_every: 5
+local_evidence_max_batches: 20
+local_evidence_cam_quantile: 0.85
+local_evidence_use_teacher: true
+local_evidence_min_area: 0.05
+local_evidence_max_area: 0.45
+local_evidence_bbox_padding: 0.02
+local_evidence_cam_type: weightcam
+local_evidence_save_images: false
+local_evidence_image_max_samples: 8
+
+part_ce: true
+local_margin: false
+part_consistency: false
+evidence_clean_reweight: false
+id_candidate: false
+multi_part: false
+d2_diag: false
+
+part_ce_weight: 0.5
+part_ce_groups: clean
+part_ce_use_teacher_cam: true
+part_ce_log: true
+part_ce_gate: true
+part_ce_gate_type: percentile
+part_ce_gate_threshold: 0.10
+part_ce_gate_keep_ratio: 0.50
+part_ce_gate_start_epoch: 20
+
+erase_consistency: true
+erase_consistency_groups: clean
+erase_consistency_require_c1_gate: true
+erase_consistency_start_epoch: 30
+erase_consistency_weight: 0.02
+erase_consistency_type: kl_ori_to_erase
+erase_consistency_temp: 2.0
+erase_consistency_stopgrad_ori: true
+erase_consistency_erase_mode: peak_window
+erase_consistency_window_ratio: 0.25
+erase_consistency_fill: mean
+erase_consistency_aux_bn_eval: true
+erase_consistency_log: true
+
+# logging
+log_root: ./results/
+log_proj: ''
+log_name: resnet50-web-bird-bg-diag
