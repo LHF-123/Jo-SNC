@@ -497,13 +497,14 @@ def main(gpu, cfg):
             raise ValueError(
                 'erase_consistency_window_ratio should be within [0.15, 0.35] for E4 first version.'
             )
+        # E4 现在允许与 C1 的 part_ce 同时开启，但仍保持其他实验分支关闭，避免交叉干扰。
         if (
-            cfg.part_ce or cfg.local_margin or cfg.part_consistency
+            cfg.local_margin or cfg.part_consistency
             or cfg.evidence_clean_reweight or cfg.id_candidate
             or cfg.multi_part or cfg.d2_diag
         ):
             raise ValueError(
-                'E4 first version should run alone: disable part_ce/local_margin/'
+                'E4 first version should only combine with part_ce: disable local_margin/'
                 'part_consistency/evidence_clean_reweight/id_candidate/multi_part/d2_diag.'
             )
     if cfg.evidence_clean_reweight:
