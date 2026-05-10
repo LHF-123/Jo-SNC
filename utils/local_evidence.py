@@ -52,6 +52,18 @@ PART_CONSISTENCY_CSV_HEADER = (
     'filtered_evidence_score_mean,skip_reason'
 )
 
+ERASE_CONSISTENCY_CSV_HEADER = (
+    'epoch,batch_idx,group,num_clean,num_valid_part,num_c1_gated,'
+    'num_erase_valid,erase_valid_ratio,erase_consistency_weight,'
+    'erase_consistency_temp,erase_consistency_loss_raw,'
+    'erase_consistency_loss_weighted,erase_consistency_loss_ratio,'
+    'p_ori_y_mean,p_erase_y_mean,c1_evidence_score_mean,'
+    'c1_erase_drop_mean,ori_conf_mean,erase_conf_mean,ori_entropy_mean,'
+    'erase_entropy_mean,ori_pred_eq_label_ratio,erase_pred_eq_label_ratio,'
+    'ori_top1_eq_erase_top1_ratio,erase_kl_mean,erase_window_area_mean,'
+    'skip_reason'
+)
+
 EVIDENCE_CLEAN_REWEIGHT_CSV_HEADER = (
     'epoch,batch_idx,num_clean,num_valid,num_invalid,num_high,num_low,'
     'valid_clean_ratio,invalid_ratio,high_ratio_valid,low_ratio_valid,'
@@ -196,6 +208,30 @@ def format_part_consistency_row(row):
         f"{row['evidence_score_mean']:.6f},"
         f"{row['gated_evidence_score_mean']:.6f},"
         f"{row['filtered_evidence_score_mean']:.6f},"
+        f"{row['skip_reason']}"
+    )
+
+
+def format_erase_consistency_row(row):
+    return (
+        f"{row['epoch']},{row['batch_idx']},{row['group']},"
+        f"{row['num_clean']},{row['num_valid_part']},{row['num_c1_gated']},"
+        f"{row['num_erase_valid']},{row['erase_valid_ratio']:.6f},"
+        f"{row['erase_consistency_weight']:.6f},"
+        f"{row['erase_consistency_temp']:.6f},"
+        f"{row['erase_consistency_loss_raw']:.6f},"
+        f"{row['erase_consistency_loss_weighted']:.6f},"
+        f"{row['erase_consistency_loss_ratio']:.6f},"
+        f"{row['p_ori_y_mean']:.6f},{row['p_erase_y_mean']:.6f},"
+        f"{row['c1_evidence_score_mean']:.6f},"
+        f"{row['c1_erase_drop_mean']:.6f},"
+        f"{row['ori_conf_mean']:.6f},{row['erase_conf_mean']:.6f},"
+        f"{row['ori_entropy_mean']:.6f},{row['erase_entropy_mean']:.6f},"
+        f"{row['ori_pred_eq_label_ratio']:.6f},"
+        f"{row['erase_pred_eq_label_ratio']:.6f},"
+        f"{row['ori_top1_eq_erase_top1_ratio']:.6f},"
+        f"{row['erase_kl_mean']:.6f},"
+        f"{row['erase_window_area_mean']:.6f},"
         f"{row['skip_reason']}"
     )
 
@@ -494,7 +530,11 @@ def build_local_part_batch(
         min_area=0.05,
         max_area=0.7,
         bbox_padding=0.05,
-        cam_type='weightcam'):
+        cam_type='weightcam',
+        erase_consistency=False,
+        erase_consistency_erase_mode='peak_window',
+        erase_consistency_window_ratio=0.25,
+        erase_consistency_fill='mean'):
     selected_indices = selected_indices.detach().long()
     num_selected = int(selected_indices.numel())
 
@@ -513,6 +553,26 @@ def build_local_part_batch(
             logits_part = _extract_logits(model(x_part))
             logits_erase = _extract_logits(model(x_erase))
             evidence_values = compute_evidence_values(logits_ori, logits_part, logits_erase, labels)
+            x_erase_consistency, erase_consistency_areas = None, None
+            if erase_consistency:
+                erase_mode = str(erase_consistency_erase_mode).lower()
+                erase_fill = str(erase_consistency_fill).lower()
+                if erase_mode != 'peak_window':
+                    raise ValueError(
+                        f'erase_consistency_erase_mode only supports peak_window, got {erase_mode}.'
+                    )
+                if erase_fill not in ['mean', 'norm_zero']:
+                    raise ValueError(
+                        f'erase_consistency_fill only supports mean/norm_zero, got {erase_fill}.'
+                    )
+                # E4 复用同一张 CAM，但单独生成 peak-window erase，避免改动 C1 evidence 语义。
+                _, peak_areas, peak_masks = cam_to_peak_window(
+                    cam, images.shape[-2:], window_ratio=erase_consistency_window_ratio
+                )
+                x_erase_consistency = erase_by_mask(images.float(), peak_masks, fill_value=0.0)
+                erase_consistency_areas = torch.tensor(
+                    peak_areas, device=images.device, dtype=images.dtype
+                )
     finally:
         if was_training:
             model.train()
@@ -522,7 +582,7 @@ def build_local_part_batch(
     valid_mask = torch.isfinite(selected_bbox_areas) & (selected_bbox_areas > 0)
     valid_indices = selected_indices[valid_mask]
 
-    return {
+    result = {
         'x_part': x_part[valid_indices],
         'x_erase': x_erase[valid_indices],
         'labels': labels[valid_indices],
@@ -538,6 +598,10 @@ def build_local_part_batch(
         'num_selected': num_selected,
         'num_valid': int(valid_indices.numel()),
     }
+    if erase_consistency:
+        result['x_erase_consistency'] = x_erase_consistency[valid_indices]
+        result['erase_consistency_area'] = erase_consistency_areas[valid_indices]
+    return result
 
 
 def build_id_candidate_batch(
@@ -1225,6 +1289,80 @@ def compute_part_consistency_loss(logits_part, logits_global, labels,
     }
 
 
+def compute_erase_consistency_loss(logits_erase, logits_ori, labels,
+                                   temperature=2.0, loss_type='kl_ori_to_erase',
+                                   stopgrad_ori=True):
+    loss_type = str(loss_type).lower()
+    if loss_type != 'kl_ori_to_erase':
+        raise ValueError(f'erase_consistency_type only supports kl_ori_to_erase, got {loss_type}.')
+    if not stopgrad_ori:
+        raise ValueError('E4 first version requires erase_consistency_stopgrad_ori=true.')
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f'erase_consistency_temp should be positive, got {temperature}.')
+
+    labels = labels.detach().long()
+    if logits_erase.numel() == 0 or logits_ori.numel() == 0 or labels.numel() == 0:
+        zero_loss = logits_erase.sum() * 0.0
+        empty = logits_erase.new_zeros((0,), dtype=torch.float)
+        empty_long = labels.new_zeros((0,), dtype=torch.long)
+        return {
+            'loss': zero_loss,
+            'losses': empty,
+            'ori_entropy': empty,
+            'erase_entropy': empty,
+            'ori_conf': empty,
+            'erase_conf': empty,
+            'ori_pred': empty_long,
+            'erase_pred': empty_long,
+            'p_ori_y': empty,
+            'p_erase_y': empty,
+            'ori_pred_eq_label': empty.to(dtype=torch.bool),
+            'erase_pred_eq_label': empty.to(dtype=torch.bool),
+            'top1_eq': empty.to(dtype=torch.bool),
+        }
+
+    if logits_erase.size(0) != logits_ori.size(0):
+        raise ValueError(
+            f'erase/original batch sizes should match, got {logits_erase.size(0)} and {logits_ori.size(0)}.'
+        )
+    if labels.numel() != logits_erase.size(0):
+        raise ValueError(f'labels size should match erase logits, got {labels.numel()} and {logits_erase.size(0)}.')
+
+    # E4 固定使用 ori -> erase 蒸馏式 KL；ori 分布只作为 soft target，不允许反传污染主分支。
+    erase_logits = logits_erase.float()
+    ori_logits = logits_ori.detach().float()
+    p_ori_t = F.softmax(ori_logits / temperature, dim=1)
+    log_p_erase_t = F.log_softmax(erase_logits / temperature, dim=1)
+    losses = F.kl_div(log_p_erase_t, p_ori_t, reduction='none').sum(dim=1) * (temperature * temperature)
+
+    ori_probs = F.softmax(ori_logits, dim=1)
+    erase_probs = F.softmax(erase_logits, dim=1)
+    ori_conf, ori_pred = ori_probs.max(dim=1)
+    erase_conf, erase_pred = erase_probs.max(dim=1)
+    label_indices = labels.to(device=erase_logits.device, dtype=torch.long).view(-1, 1)
+    p_ori_y = ori_probs.gather(1, label_indices).squeeze(1)
+    p_erase_y = erase_probs.gather(1, label_indices).squeeze(1)
+    ori_entropy = -(ori_probs * ori_probs.clamp(min=1e-12).log()).sum(dim=1)
+    erase_entropy = -(erase_probs * erase_probs.clamp(min=1e-12).log()).sum(dim=1)
+
+    return {
+        'loss': losses.mean(),
+        'losses': losses.detach(),
+        'ori_entropy': ori_entropy.detach(),
+        'erase_entropy': erase_entropy.detach(),
+        'ori_conf': ori_conf.detach(),
+        'erase_conf': erase_conf.detach(),
+        'ori_pred': ori_pred.detach(),
+        'erase_pred': erase_pred.detach(),
+        'p_ori_y': p_ori_y.detach(),
+        'p_erase_y': p_erase_y.detach(),
+        'ori_pred_eq_label': ori_pred.detach().eq(labels.to(device=ori_pred.device)),
+        'erase_pred_eq_label': erase_pred.detach().eq(labels.to(device=erase_pred.device)),
+        'top1_eq': ori_pred.detach().eq(erase_pred.detach()),
+    }
+
+
 def build_evidence_clean_weights(idx_clean, part_batch, clean_losses,
                                  high_weight=1.0, low_weight=0.5,
                                  batch_size=None):
@@ -1482,6 +1620,68 @@ def build_part_consistency_log_row(epoch, batch_idx, group, part_batch, total_lo
         'evidence_score_mean': evidence_stats['evidence_score_mean'],
         'gated_evidence_score_mean': evidence_stats['gated_evidence_score_mean'],
         'filtered_evidence_score_mean': evidence_stats['filtered_evidence_score_mean'],
+        'skip_reason': skip_reason or 'none',
+    }
+
+
+def build_erase_consistency_log_row(epoch, batch_idx, group, part_batch, base_loss,
+                                    erase_result, erase_consistency_weight,
+                                    erase_consistency_temp, skip_reason=''):
+    num_clean = int(part_batch.get('num_selected', 0))
+    num_valid_part = int(part_batch.get('num_valid', 0))
+    gate_mask = _part_batch_gate_mask(part_batch)
+    num_c1_gated = int(gate_mask.sum().item()) if gate_mask is not None else 0
+
+    if erase_result is None:
+        return _empty_erase_consistency_log_row(
+            epoch, batch_idx, group, num_clean, num_valid_part, num_c1_gated,
+            part_batch, erase_consistency_weight, erase_consistency_temp,
+            skip_reason or 'not_run'
+        )
+
+    losses = erase_result['losses'].detach()
+    num_erase_valid = int(losses.numel())
+    if num_erase_valid == 0:
+        return _empty_erase_consistency_log_row(
+            epoch, batch_idx, group, num_clean, num_valid_part, num_c1_gated,
+            part_batch, erase_consistency_weight, erase_consistency_temp,
+            skip_reason or 'empty_loss'
+        )
+
+    raw_loss = float(erase_result['loss'].detach().item())
+    weighted_loss = float(erase_consistency_weight) * raw_loss
+    base_loss_value = float(base_loss.detach().item())
+    # E4 日志固定以 clean/ID/OOD 分类主 loss 为分母，便于判断 erase 正则相对主监督的强度。
+    loss_ratio = weighted_loss / max(abs(base_loss_value), 1e-12)
+    e4_stats = _erase_consistency_evidence_stats(part_batch)
+
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'num_clean': num_clean,
+        'num_valid_part': num_valid_part,
+        'num_c1_gated': num_c1_gated,
+        'num_erase_valid': num_erase_valid,
+        'erase_valid_ratio': float(num_erase_valid / max(num_valid_part, 1)),
+        'erase_consistency_weight': float(erase_consistency_weight),
+        'erase_consistency_temp': float(erase_consistency_temp),
+        'erase_consistency_loss_raw': raw_loss,
+        'erase_consistency_loss_weighted': weighted_loss,
+        'erase_consistency_loss_ratio': loss_ratio,
+        'p_ori_y_mean': _mean_or_zero(erase_result['p_ori_y']),
+        'p_erase_y_mean': _mean_or_zero(erase_result['p_erase_y']),
+        'c1_evidence_score_mean': e4_stats['c1_evidence_score_mean'],
+        'c1_erase_drop_mean': e4_stats['c1_erase_drop_mean'],
+        'ori_conf_mean': _mean_or_zero(erase_result['ori_conf']),
+        'erase_conf_mean': _mean_or_zero(erase_result['erase_conf']),
+        'ori_entropy_mean': _mean_or_zero(erase_result['ori_entropy']),
+        'erase_entropy_mean': _mean_or_zero(erase_result['erase_entropy']),
+        'ori_pred_eq_label_ratio': _mean_or_zero(erase_result['ori_pred_eq_label'].float()),
+        'erase_pred_eq_label_ratio': _mean_or_zero(erase_result['erase_pred_eq_label'].float()),
+        'ori_top1_eq_erase_top1_ratio': _mean_or_zero(erase_result['top1_eq'].float()),
+        'erase_kl_mean': _mean_or_zero(losses),
+        'erase_window_area_mean': e4_stats['erase_window_area_mean'],
         'skip_reason': skip_reason or 'none',
     }
 
@@ -2243,6 +2443,42 @@ def _empty_part_consistency_log_row(epoch, batch_idx, group, num_clean,
     }
 
 
+def _empty_erase_consistency_log_row(epoch, batch_idx, group, num_clean,
+                                     num_valid_part, num_c1_gated, part_batch,
+                                     erase_consistency_weight,
+                                     erase_consistency_temp, skip_reason):
+    e4_stats = _erase_consistency_evidence_stats(part_batch)
+    return {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'group': group,
+        'num_clean': int(num_clean),
+        'num_valid_part': int(num_valid_part),
+        'num_c1_gated': int(num_c1_gated),
+        'num_erase_valid': 0,
+        'erase_valid_ratio': 0.0,
+        'erase_consistency_weight': float(erase_consistency_weight),
+        'erase_consistency_temp': float(erase_consistency_temp),
+        'erase_consistency_loss_raw': 0.0,
+        'erase_consistency_loss_weighted': 0.0,
+        'erase_consistency_loss_ratio': 0.0,
+        'p_ori_y_mean': 0.0,
+        'p_erase_y_mean': 0.0,
+        'c1_evidence_score_mean': e4_stats['c1_evidence_score_mean'],
+        'c1_erase_drop_mean': e4_stats['c1_erase_drop_mean'],
+        'ori_conf_mean': 0.0,
+        'erase_conf_mean': 0.0,
+        'ori_entropy_mean': 0.0,
+        'erase_entropy_mean': 0.0,
+        'ori_pred_eq_label_ratio': 0.0,
+        'erase_pred_eq_label_ratio': 0.0,
+        'ori_top1_eq_erase_top1_ratio': 0.0,
+        'erase_kl_mean': 0.0,
+        'erase_window_area_mean': e4_stats['erase_window_area_mean'],
+        'skip_reason': skip_reason,
+    }
+
+
 def _evidence_clean_context(valid_clean_mask, high_clean_mask, low_clean_mask):
     invalid_clean_mask = valid_clean_mask.logical_not()
     return {
@@ -2356,6 +2592,38 @@ def _part_consistency_evidence_stats(part_batch, gate_mask):
     stats['evidence_score_mean'] = _mean_or_zero(evidence_score)
     stats['gated_evidence_score_mean'] = _mean_or_zero(evidence_score[gate_mask])
     stats['filtered_evidence_score_mean'] = _mean_or_zero(evidence_score[filtered_mask])
+    return stats
+
+
+def _erase_consistency_evidence_stats(part_batch):
+    stats = {
+        'c1_evidence_score_mean': 0.0,
+        'c1_erase_drop_mean': 0.0,
+        'erase_window_area_mean': 0.0,
+    }
+    if part_batch is None or part_batch.get('num_valid', 0) <= 0:
+        return stats
+
+    evidence_score = part_batch.get('evidence_score')
+    erase_drop = part_batch.get('erase_drop')
+    erase_area = part_batch.get('erase_consistency_area')
+    if evidence_score is None or evidence_score.numel() == 0:
+        return stats
+
+    mask = part_batch.get('erase_consistency_mask')
+    if mask is None:
+        mask = _part_batch_gate_mask(part_batch)
+    if mask is None:
+        mask = torch.ones(evidence_score.numel(), device=evidence_score.device, dtype=torch.bool)
+    else:
+        mask = mask.to(device=evidence_score.device, dtype=torch.bool)
+
+    # E4 日志只统计实际 erase consistency 子集，用来确认其确实来自 C1 high-evidence clean。
+    stats['c1_evidence_score_mean'] = _mean_or_zero(evidence_score.detach()[mask])
+    if erase_drop is not None:
+        stats['c1_erase_drop_mean'] = _mean_or_zero(erase_drop.detach()[mask])
+    if erase_area is not None:
+        stats['erase_window_area_mean'] = _mean_or_zero(erase_area.detach()[mask])
     return stats
 
 

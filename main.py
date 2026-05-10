@@ -37,6 +37,7 @@ from utils.loss import *
 from utils.local_evidence import (
     D2_DIAG_CSV_HEADER,
     D2_DIAG_SAMPLE_CSV_HEADER,
+    ERASE_CONSISTENCY_CSV_HEADER,
     EVIDENCE_CLEAN_REWEIGHT_CSV_HEADER,
     ID_CANDIDATE_CSV_HEADER,
     ID_CANDIDATE_SAMPLE_CSV_HEADER,
@@ -48,6 +49,7 @@ from utils.local_evidence import (
     PART_CE_GATE_SAMPLE_CSV_HEADER,
     PART_CE_CSV_HEADER,
     attach_id_candidate_loss_results,
+    build_erase_consistency_log_row,
     build_evidence_clean_reweight_log_row,
     build_evidence_clean_weights,
     build_id_candidate_batch,
@@ -62,12 +64,14 @@ from utils.local_evidence import (
     compute_id_candidate_effective_weight,
     compute_id_candidate_loss,
     compute_d2_diag,
+    compute_erase_consistency_loss,
     compute_local_evidence,
     compute_local_margin_loss,
     compute_multi_part_evidence,
     compute_part_consistency_loss,
     format_d2_diag_row,
     format_d2_diag_sample_row,
+    format_erase_consistency_row,
     format_evidence_clean_reweight_row,
     format_id_candidate_row,
     format_id_candidate_sample_row,
@@ -305,6 +309,22 @@ def _should_run_d2_diag(cfg, epoch, batch_idx):
     return True
 
 
+def _set_batchnorm_eval(module):
+    # E4 erased-view 是辅助扰动视图，只冻结 BN running stats，仍保留其它层训练和梯度。
+    states = []
+    for submodule in module.modules():
+        if isinstance(submodule, nn.modules.batchnorm._BatchNorm):
+            states.append((submodule, submodule.training))
+            submodule.eval()
+    return states
+
+
+def _restore_module_training_states(states):
+    # 恢复 E4 辅助前向前的 BN train/eval 状态，避免影响后续主训练分支。
+    for module, was_training in states:
+        module.train(was_training)
+
+
 def generate_label_sets(batch_label_sets, nc):
     bs = batch_label_sets.size(0)
     label_sets = torch.zeros(bs, nc).to(batch_label_sets.device)
@@ -442,6 +462,50 @@ def main(gpu, cfg):
                 'F1 first version should run alone: disable part_ce/local_margin/'
                 'evidence_clean_reweight/id_candidate/multi_part/d2_diag.'
             )
+    if cfg.erase_consistency:
+        if cfg.erase_consistency_groups != 'clean':
+            raise ValueError(
+                f'E4 erase_consistency currently supports clean only, got {cfg.erase_consistency_groups}.'
+            )
+        if cfg.erase_consistency_type != 'kl_ori_to_erase':
+            raise ValueError(
+                f'erase_consistency_type should be kl_ori_to_erase, got {cfg.erase_consistency_type}.'
+            )
+        if not cfg.erase_consistency_require_c1_gate:
+            raise ValueError('E4 first version requires erase_consistency_require_c1_gate=true.')
+        if cfg.erase_consistency_require_c1_gate and not cfg.part_ce_gate:
+            raise ValueError('E4 requires part_ce_gate=true when erase_consistency_require_c1_gate=true.')
+        if cfg.part_ce_gate_type != 'percentile':
+            raise ValueError('E4 first version requires part_ce_gate_type=percentile.')
+        if not cfg.erase_consistency_stopgrad_ori:
+            raise ValueError('E4 first version requires erase_consistency_stopgrad_ori=true.')
+        if cfg.erase_consistency_start_epoch < 0:
+            raise ValueError('erase_consistency_start_epoch should be non-negative.')
+        if cfg.erase_consistency_weight < 0.0:
+            raise ValueError('erase_consistency_weight should be non-negative.')
+        if cfg.erase_consistency_temp <= 0.0:
+            raise ValueError('erase_consistency_temp should be positive.')
+        if cfg.erase_consistency_erase_mode != 'peak_window':
+            raise ValueError(
+                f'erase_consistency_erase_mode should be peak_window, got {cfg.erase_consistency_erase_mode}.'
+            )
+        if cfg.erase_consistency_fill not in ['mean', 'norm_zero']:
+            raise ValueError(
+                f'erase_consistency_fill should be mean or norm_zero, got {cfg.erase_consistency_fill}.'
+            )
+        if not (0.15 <= cfg.erase_consistency_window_ratio <= 0.35):
+            raise ValueError(
+                'erase_consistency_window_ratio should be within [0.15, 0.35] for E4 first version.'
+            )
+        if (
+            cfg.part_ce or cfg.local_margin or cfg.part_consistency
+            or cfg.evidence_clean_reweight or cfg.id_candidate
+            or cfg.multi_part or cfg.d2_diag
+        ):
+            raise ValueError(
+                'E4 first version should run alone: disable part_ce/local_margin/'
+                'part_consistency/evidence_clean_reweight/id_candidate/multi_part/d2_diag.'
+            )
     if cfg.evidence_clean_reweight:
         if cfg.evidence_clean_reweight_groups != 'clean':
             raise ValueError(
@@ -572,6 +636,14 @@ def main(gpu, cfg):
             root_dir=result_dir,
             filename='part_consistency.csv',
             header=PART_CONSISTENCY_CSV_HEADER,
+        )
+    erase_consistency_writer = None
+    if cfg.erase_consistency and cfg.erase_consistency_log:
+        # E4 单独记录 erased-view KL 强度和 C1 high-evidence 子集质量，不混入 C1/F1 日志。
+        erase_consistency_writer = Writer(
+            root_dir=result_dir,
+            filename='erase_consistency.csv',
+            header=ERASE_CONSISTENCY_CSV_HEADER,
         )
     evidence_clean_reweight_writer = None
     if cfg.evidence_clean_reweight and cfg.evidence_clean_reweight_log:
@@ -816,6 +888,8 @@ def main(gpu, cfg):
                     local_margin_result = None
                     part_consistency_result = None
                     part_consistency_skip_reason = 'disabled'
+                    erase_consistency_result = None
+                    erase_consistency_skip_reason = 'disabled'
                     evidence_clean_context = None
                     clean_loss_weight = torch.ones_like(losses_cls_clean)
                     raw_clean_losses = losses_cls_clean.detach()
@@ -830,13 +904,21 @@ def main(gpu, cfg):
                         and (epoch + 1) >= cfg.part_consistency_start_epoch
                         and (epoch + 1) >= cfg.part_ce_gate_start_epoch
                     )
+                    run_erase_consistency = (
+                        cfg.erase_consistency
+                        and (epoch + 1) >= cfg.erase_consistency_start_epoch
+                        and (epoch + 1) >= cfg.part_ce_gate_start_epoch
+                    )
                     if cfg.part_consistency:
                         part_consistency_skip_reason = 'not_started' if not run_part_consistency else 'no_clean'
+                    if cfg.erase_consistency:
+                        erase_consistency_skip_reason = 'not_started' if not run_erase_consistency else 'no_clean'
                     need_clean_part_gate = (
                         cfg.part_ce
                         or cfg.local_margin
                         or run_evidence_clean_reweight
                         or run_part_consistency
+                        or run_erase_consistency
                     )
                     if need_clean_part_gate and idx_clean.numel() > 0:
                         cam_model = k_model if cfg.part_ce_use_teacher_cam else q_model
@@ -847,6 +929,10 @@ def main(gpu, cfg):
                             max_area=cfg.local_evidence_max_area,
                             bbox_padding=cfg.local_evidence_bbox_padding,
                             cam_type=cfg.local_evidence_cam_type,
+                            erase_consistency=run_erase_consistency,
+                            erase_consistency_erase_mode=cfg.erase_consistency_erase_mode,
+                            erase_consistency_window_ratio=cfg.erase_consistency_window_ratio,
+                            erase_consistency_fill=cfg.erase_consistency_fill,
                         )
                         if clean_part_batch['num_valid'] > 0 and clean_part_batch['x_part'].numel() > 0:
                             use_c1_gate = cfg.part_ce_gate or (
@@ -855,6 +941,8 @@ def main(gpu, cfg):
                                 cfg.evidence_clean_reweight and cfg.evidence_clean_use_c1_gate
                             ) or (
                                 cfg.part_consistency and cfg.part_consistency_require_c1_gate
+                            ) or (
+                                cfg.erase_consistency and cfg.erase_consistency_require_c1_gate
                             )
                             if use_c1_gate:
                                 if (epoch + 1) >= cfg.part_ce_gate_start_epoch:
@@ -883,8 +971,11 @@ def main(gpu, cfg):
                             clean_part_batch['gate_threshold'] = gate_threshold
                             clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
                             clean_part_batch['part_consistency_mask'] = torch.zeros_like(gate_mask)
+                            clean_part_batch['erase_consistency_mask'] = torch.zeros_like(gate_mask)
                         elif run_part_consistency:
                             part_consistency_skip_reason = 'no_valid_part'
+                        elif run_erase_consistency:
+                            erase_consistency_skip_reason = 'no_valid_part'
 
                     if run_evidence_clean_reweight:
                         clean_loss_weight, evidence_clean_context = build_evidence_clean_weights(
@@ -930,15 +1021,21 @@ def main(gpu, cfg):
                         run_part_ce_loss = cfg.part_ce
                         run_local_margin_loss = cfg.local_margin and (epoch + 1) >= cfg.local_margin_start_epoch
                         run_part_consistency_loss = run_part_consistency
+                        run_erase_consistency_loss = run_erase_consistency
                         if run_part_consistency_loss and num_gated == 0:
                             part_consistency_skip_reason = 'no_c1_gated'
-                        if num_gated > 1 and (run_part_ce_loss or run_local_margin_loss or run_part_consistency_loss):
-                            # C1/D3/F1 仍只让实际通过 gate 的局部图进入 student 训练前向。
+                        if run_erase_consistency_loss and num_gated == 0:
+                            erase_consistency_skip_reason = 'no_c1_gated'
+                        need_part_forward = run_part_ce_loss or run_local_margin_loss or run_part_consistency_loss
+                        need_erase_forward = run_erase_consistency_loss
+                        if num_gated > 1 and (need_part_forward or need_erase_forward):
+                            # C1/D3/F1/E4 仍只让实际通过 gate 的 clean 样本进入额外训练前向。
                             student_was_training = q_model.training
                             q_model.train()
                             try:
-                                logits_part = q_model(clean_part_batch['x_part'][gate_mask])[0]
                                 labels_part = clean_part_batch['labels'][gate_mask]
+                                if need_part_forward:
+                                    logits_part = q_model(clean_part_batch['x_part'][gate_mask])[0]
                                 if run_part_ce_loss:
                                     part_ce_loss = F.cross_entropy(logits_part, labels_part)
                                     loss = loss + cfg.part_ce_weight * part_ce_loss
@@ -967,14 +1064,48 @@ def main(gpu, cfg):
                                     loss = loss + cfg.part_consistency_weight * part_consistency_result['loss']
                                     clean_part_batch['part_consistency_mask'] = gate_mask.detach().clone()
                                     part_consistency_skip_reason = 'none'
+                                if need_erase_forward:
+                                    if 'x_erase_consistency' not in clean_part_batch:
+                                        erase_consistency_skip_reason = 'no_erase_view'
+                                        clean_part_batch['erase_consistency_mask'] = torch.zeros_like(gate_mask)
+                                    else:
+                                        # E4 使用独立 mask 和 batch_indices，保证 ori target 与 erased view 顺序一一对应。
+                                        erase_consistency_mask = gate_mask.detach().clone()
+                                        erase_batch_indices = clean_part_batch['batch_indices'][erase_consistency_mask]
+                                        x_erase_selected = clean_part_batch['x_erase_consistency'][erase_consistency_mask]
+                                        labels_erase = clean_part_batch['labels'][erase_consistency_mask]
+                                        logits_ori_selected = logits1[erase_batch_indices].detach()
+                                        if cfg.erase_consistency_aux_bn_eval:
+                                            bn_states = _set_batchnorm_eval(q_model)
+                                            try:
+                                                logits_erase = q_model(x_erase_selected)[0]
+                                            finally:
+                                                _restore_module_training_states(bn_states)
+                                        else:
+                                            logits_erase = q_model(x_erase_selected)[0]
+                                        erase_consistency_result = compute_erase_consistency_loss(
+                                            logits_erase, logits_ori_selected, labels_erase,
+                                            temperature=cfg.erase_consistency_temp,
+                                            loss_type=cfg.erase_consistency_type,
+                                            stopgrad_ori=cfg.erase_consistency_stopgrad_ori,
+                                        )
+                                        loss = loss + cfg.erase_consistency_weight * erase_consistency_result['loss']
+                                        clean_part_batch['erase_consistency_mask'] = erase_consistency_mask
+                                        erase_consistency_skip_reason = 'none'
                             finally:
                                 if not student_was_training:
                                     q_model.eval()
-                        elif num_gated == 1 and (run_part_ce_loss or run_local_margin_loss or run_part_consistency_loss):
-                            # 单样本会触发 BatchNorm1d 训练模式约束，C1/D3/F1 跳过；E1 的 evidence gate 另存不受影响。
+                        elif num_gated == 1 and (
+                            run_part_ce_loss or run_local_margin_loss
+                            or run_part_consistency_loss or run_erase_consistency_loss
+                        ):
+                            # 单样本会触发 BatchNorm1d 训练模式约束；E4 只跳过自身，不改 C1 evidence gate。
                             if run_part_consistency_loss:
                                 part_consistency_skip_reason = 'single_sample_bn'
                                 clean_part_batch['part_consistency_mask'] = torch.zeros_like(gate_mask)
+                            if run_erase_consistency_loss:
+                                erase_consistency_skip_reason = 'single_sample_bn'
+                                clean_part_batch['erase_consistency_mask'] = torch.zeros_like(gate_mask)
                             if run_part_ce_loss or run_local_margin_loss:
                                 clean_part_batch['gate_mask'] = torch.zeros_like(gate_mask)
                                 clean_part_batch['local_margin_mask'] = torch.zeros_like(gate_mask)
@@ -1020,6 +1151,14 @@ def main(gpu, cfg):
                             skip_reason=part_consistency_skip_reason,
                         )
                         part_consistency_writer.write(format_part_consistency_row(part_consistency_row))
+                    if erase_consistency_writer is not None:
+                        erase_consistency_row = build_erase_consistency_log_row(
+                            epoch + 1, it, clean_part_group, clean_part_batch,
+                            loss_cls, erase_consistency_result,
+                            cfg.erase_consistency_weight, cfg.erase_consistency_temp,
+                            skip_reason=erase_consistency_skip_reason,
+                        )
+                        erase_consistency_writer.write(format_erase_consistency_row(erase_consistency_row))
 
                     if cfg.id_candidate:
                         id_candidate_loss = loss.new_tensor(0.0)
@@ -1380,6 +1519,13 @@ def check_args(args):
         'part_consistency_weight', 'part_consistency_type',
         'part_consistency_temp', 'part_consistency_use_teacher_global',
         'part_consistency_stopgrad_global', 'part_consistency_log',
+        'erase_consistency', 'erase_consistency_groups',
+        'erase_consistency_require_c1_gate', 'erase_consistency_start_epoch',
+        'erase_consistency_weight', 'erase_consistency_type',
+        'erase_consistency_temp', 'erase_consistency_stopgrad_ori',
+        'erase_consistency_erase_mode', 'erase_consistency_window_ratio',
+        'erase_consistency_fill', 'erase_consistency_aux_bn_eval',
+        'erase_consistency_log',
         'evidence_clean_reweight', 'evidence_clean_reweight_start_epoch',
         'evidence_clean_reweight_groups', 'evidence_clean_reweight_type',
         'evidence_clean_high_weight', 'evidence_clean_low_weight',
@@ -1568,6 +1714,34 @@ def parse_args():
                         help='是否写出 part_consistency.csv 诊断日志。')
 
     # E1 evidence-aware clean reweight：用 C1 evidence gate 调整原图 clean CE 权重。
+    # E4 erased-view consistency：复用 C1 actual gate，但单独生成 peak-window erase 视图做弱 KL 正则。
+    parser.add_argument('--erase-consistency', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 E4 C1-gated erased-view KL consistency 分支。')
+    parser.add_argument('--erase-consistency-groups', type=str, default=None,
+                        help='E4 使用哪些 Jo-SNC 分组；第一版只支持 clean。')
+    parser.add_argument('--erase-consistency-require-c1-gate', action=argparse.BooleanOptionalAction, default=None,
+                        help='E4 是否必须复用 C1 actual gate；第一版必须为 true。')
+    parser.add_argument('--erase-consistency-start-epoch', type=int, default=None,
+                        help='从第几个用户可见 epoch 开始启用 E4 KL consistency。')
+    parser.add_argument('--erase-consistency-weight', type=float, default=None,
+                        help='E4 KL consistency loss 加到总 loss 的权重。')
+    parser.add_argument('--erase-consistency-type', type=str, default=None,
+                        help='E4 consistency 类型；第一版只支持 kl_ori_to_erase。')
+    parser.add_argument('--erase-consistency-temp', type=float, default=None,
+                        help='E4 KL consistency 的 softmax temperature。')
+    parser.add_argument('--erase-consistency-stopgrad-ori', action=argparse.BooleanOptionalAction, default=None,
+                        help='E4 是否对原图 soft target 停止梯度；第一版必须为 true。')
+    parser.add_argument('--erase-consistency-erase-mode', type=str, default=None,
+                        help='E4 擦除视图生成方式；第一版只支持 peak_window。')
+    parser.add_argument('--erase-consistency-window-ratio', type=float, default=None,
+                        help='E4 peak window 的边长占图像边长比例。')
+    parser.add_argument('--erase-consistency-fill', type=str, default=None,
+                        help='E4 擦除填充值；mean 表示 normalized 空间填 0。')
+    parser.add_argument('--erase-consistency-aux-bn-eval', action=argparse.BooleanOptionalAction, default=None,
+                        help='E4 辅助 erased forward 是否临时冻结 BN running stats。')
+    parser.add_argument('--erase-consistency-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 erase_consistency.csv 诊断日志。')
+
     parser.add_argument('--evidence-clean-reweight', action=argparse.BooleanOptionalAction, default=None,
                         help='开启 E1 clean 原图 CE evidence reweight。')
     parser.add_argument('--evidence-clean-reweight-start-epoch', type=int, default=None,
@@ -1777,6 +1951,20 @@ def parse_args():
     args.setdefault('part_consistency_stopgrad_global', True)
     args.setdefault('part_consistency_log', True)
     # E1 默认关闭；开启后只改 clean 原图 CE 样本权重，不额外添加 loss。
+    # E4 默认关闭；开启后复用 C1 actual gate，并对单独 peak-window erased view 加弱 KL 正则。
+    args.setdefault('erase_consistency', False)
+    args.setdefault('erase_consistency_groups', 'clean')
+    args.setdefault('erase_consistency_require_c1_gate', True)
+    args.setdefault('erase_consistency_start_epoch', 30)
+    args.setdefault('erase_consistency_weight', 0.02)
+    args.setdefault('erase_consistency_type', 'kl_ori_to_erase')
+    args.setdefault('erase_consistency_temp', 2.0)
+    args.setdefault('erase_consistency_stopgrad_ori', True)
+    args.setdefault('erase_consistency_erase_mode', 'peak_window')
+    args.setdefault('erase_consistency_window_ratio', 0.25)
+    args.setdefault('erase_consistency_fill', 'mean')
+    args.setdefault('erase_consistency_aux_bn_eval', True)
+    args.setdefault('erase_consistency_log', True)
     args.setdefault('evidence_clean_reweight', False)
     args.setdefault('evidence_clean_reweight_start_epoch', 20)
     args.setdefault('evidence_clean_reweight_groups', 'clean')
@@ -1844,6 +2032,10 @@ def parse_args():
     args['local_margin_hard_negative'] = str(args['local_margin_hard_negative']).strip().lower()
     args['part_consistency_groups'] = str(args['part_consistency_groups']).strip().lower()
     args['part_consistency_type'] = str(args['part_consistency_type']).strip().lower()
+    args['erase_consistency_groups'] = str(args['erase_consistency_groups']).strip().lower()
+    args['erase_consistency_type'] = str(args['erase_consistency_type']).strip().lower()
+    args['erase_consistency_erase_mode'] = str(args['erase_consistency_erase_mode']).strip().lower()
+    args['erase_consistency_fill'] = str(args['erase_consistency_fill']).strip().lower()
     args['evidence_clean_reweight_groups'] = str(args['evidence_clean_reweight_groups']).strip().lower()
     args['evidence_clean_reweight_type'] = str(args['evidence_clean_reweight_type']).strip().lower()
     args['id_candidate_cam_target'] = str(args['id_candidate_cam_target']).lower()
