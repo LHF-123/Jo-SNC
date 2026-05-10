@@ -1,5 +1,5 @@
 # 训练集前向诊断专用配置
-# 用法：配合 scripts/bg_diag.py 和 C1 checkpoint，只做前向，不训练。
+# 用法：配合 bg_diag.py 和 C1 checkpoint，只做前向，不训练。
 
 # dataset
 data_root: /root/autodl-tmp/
@@ -78,7 +78,7 @@ part_ce_gate_threshold: 0.10
 part_ce_gate_keep_ratio: 0.50
 part_ce_gate_start_epoch: 20
 
-erase_consistency: true
+erase_consistency: false
 erase_consistency_groups: clean
 erase_consistency_require_c1_gate: true
 erase_consistency_start_epoch: 30

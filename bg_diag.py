@@ -198,6 +198,31 @@ def _build_fg_view(images, bg_mask, fill_value=0.0):
     return erase_by_mask(images, bg_mask, fill_value=fill_value)
 
 
+def _low_cam_mask(cam_up, ratio):
+    # 先按数值阈值选低响应区域；平局像素用确定性的哈希 tie-break，避免行列偏置。
+    flat = cam_up.flatten(1)
+    num_pixels = flat.size(1)
+    k = max(1, int(round(float(ratio) * num_pixels)))
+    k = min(k, num_pixels)
+    mask = torch.zeros_like(flat, dtype=torch.bool)
+    thresholds = flat.new_empty((flat.size(0),))
+    for i in range(flat.size(0)):
+        values = flat[i]
+        threshold = values.kthvalue(k).values
+        thresholds[i] = threshold
+        below_mask = values < threshold
+        eq_idx = torch.nonzero(values == threshold, as_tuple=False).flatten()
+        need = int(k - int(below_mask.sum().item()))
+        if need > 0 and eq_idx.numel() > 0:
+            # 对平局像素使用稳定的坐标哈希排序，保证复现且不引入固定行列偏置。
+            hashed = (eq_idx.to(torch.int64) * 1103515245 + 12345) % 2147483647
+            tie_order = torch.argsort(hashed, descending=False)
+            chosen_eq = eq_idx[tie_order[:need]]
+            below_mask[chosen_eq] = True
+        mask[i] = below_mask
+    return mask.view_as(cam_up), thresholds
+
+
 def _save_visualization(output_dir, sample_name, ratio, image, cam_up, bg_mask, x_bg, x_fg,
                         ori_pred, ori_conf, bg_pred, bg_conf, fg_pred, fg_conf, label,
                         norm_mean, norm_std):
@@ -289,10 +314,8 @@ def run_diagnosis(cfg, args):
             cam_up = F.interpolate(cam[:, None, :, :], size=images.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
 
             for ratio in ratios:
-                # 每张图独立取低响应分位数，避免不同样本的 CAM 尺度差异互相干扰。
-                flat = cam_up.flatten(1)
-                threshold = torch.quantile(flat, ratio, dim=1, keepdim=True)
-                bg_mask = cam_up <= threshold.view(-1, 1, 1)
+                # 按最低 k 个像素构造 mask，保证不同 ratio 产生的区域确实不同。
+                bg_mask, cam_thresholds = _low_cam_mask(cam_up, ratio)
                 bg_view = _build_bg_view(images, bg_mask, fill_value=0.0)
                 fg_view = _build_fg_view(images, bg_mask, fill_value=0.0)
 
@@ -340,7 +363,7 @@ def run_diagnosis(cfg, args):
                         'bg_drop': float(bg_drop[i].item()),
                         'fg_drop': float(fg_drop[i].item()),
                         'bg_area_ratio': float(bg_area_ratio[i].item()),
-                        'cam_low_threshold': float(threshold[i].item()),
+                        'cam_low_threshold': float(cam_thresholds[i].item()),
                         'feat_cos_ori_bg': float(feat_cos_ori_bg[i].item()) if feat_cos_ori_bg is not None else '',
                         'feat_cos_fg_bg': float(feat_cos_fg_bg[i].item()) if feat_cos_fg_bg is not None else '',
                     }
