@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 
 from torchvision.datasets import DatasetFolder
-from PIL import Image
+from PIL import Image, ImageFile
 from tqdm import tqdm
 
 
 IMG_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp')
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def pil_loader(path):

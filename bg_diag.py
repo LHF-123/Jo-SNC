@@ -13,6 +13,7 @@ import yaml
 from easydict import EasyDict as edict
 from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from data.anmal10n import Animal10N
 from data.food101n import Food101N
@@ -262,7 +263,7 @@ def run_diagnosis(cfg, args):
     processed = 0
     writer = None
     with open(csv_path, 'w', newline='', encoding='utf-8') as f_csv, torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, total=len(loader), ncols=100, ascii=' >', desc='bg-diagnosis'):
             images = batch['data'].to(device, non_blocking=True)
             labels = batch['label'].long().to(device, non_blocking=True)
             indices = batch['index'].long().cpu().tolist()

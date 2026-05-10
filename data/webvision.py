@@ -12,9 +12,11 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 import random
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 import torch
 import os
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 class imagenet_dataset(Dataset):

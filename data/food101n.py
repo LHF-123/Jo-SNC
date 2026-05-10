@@ -10,8 +10,10 @@
 # ================================================================
 import os
 from torchvision.datasets import VisionDataset
-from PIL import Image
+from PIL import Image, ImageFile
 from tqdm import tqdm
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def pil_loader(path):

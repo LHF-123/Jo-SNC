@@ -10,7 +10,9 @@
 # ================================================================
 import os
 from torch.utils.data.dataset import Dataset
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 class Animal10N(Dataset):
