@@ -83,6 +83,18 @@ from utils.local_evidence import (
     format_part_ce_gate_sample_row,
     format_part_ce_row,
 )
+from utils.prototype import (
+    EVIDENCE_PROTO_CSV_HEADER,
+    build_evidence_proto_log_row,
+    compute_confidence_update_weights,
+    compute_evidence_update_weights,
+    compute_prototype_softmax_loss,
+    format_evidence_proto_row,
+    init_prototype_state,
+    load_prototype_state,
+    prototype_checkpoint_items,
+    update_prototype_bank_weighted,
+)
 
 from PIL import ImageFile
 
@@ -616,6 +628,72 @@ def main(gpu, cfg):
             )
         if not (0.0 <= cfg.multi_part_iou_thr <= 1.0):
             raise ValueError(f'multi_part_iou_thr should be within [0, 1], got {cfg.multi_part_iou_thr}.')
+    prototype_enabled = cfg.evidence_proto_align or cfg.normal_proto_align
+    if cfg.evidence_proto_align and cfg.normal_proto_align:
+        raise ValueError('EAPA and normal prototype should be run in separate experiments.')
+    if cfg.local_evidence_score_type != 'c1':
+        raise ValueError(f'local_evidence_score_type should be c1, got {cfg.local_evidence_score_type}.')
+    if cfg.local_evidence_rank_scope != 'batch_update_candidates':
+        raise ValueError(
+            f'local_evidence_rank_scope should be batch_update_candidates, got {cfg.local_evidence_rank_scope}.'
+        )
+    if prototype_enabled:
+        if cfg.part_ce or cfg.local_margin or cfg.part_consistency or cfg.erase_consistency:
+            raise ValueError('Prototype v1 should not mix with part_ce/local_margin/part_consistency/erase_consistency.')
+        if cfg.evidence_clean_reweight or cfg.id_candidate or cfg.multi_part or cfg.d2_diag:
+            raise ValueError('Prototype v1 should not mix with E1/C2/D1/D2 branches.')
+        if cfg.evidence_proto_align:
+            if cfg.evidence_proto_groups != 'clean':
+                raise ValueError(f'evidence_proto_groups should be clean, got {cfg.evidence_proto_groups}.')
+            if cfg.evidence_proto_require_c1_gate:
+                raise ValueError('EAPA v1 uses evidence-weighted update and should set require_c1_gate=false.')
+            if not cfg.evidence_proto_bank:
+                raise ValueError('EAPA v1 requires evidence_proto_bank=true.')
+            if cfg.evidence_proto_feature != 'projected':
+                raise ValueError(f'EAPA v1 supports projected feature only, got {cfg.evidence_proto_feature}.')
+            if cfg.evidence_proto_feature_dim != cfg.fdim:
+                raise ValueError('evidence_proto_feature_dim should match cfg.fdim for projected features.')
+            if cfg.evidence_proto_init != 'zero':
+                raise ValueError(f'evidence_proto_init should be zero, got {cfg.evidence_proto_init}.')
+            if cfg.evidence_proto_update_feature != 'teacher_ema':
+                raise ValueError('EAPA v1 requires teacher_ema update feature.')
+            if cfg.evidence_proto_loss_feature != 'student':
+                raise ValueError('EAPA v1 requires student loss feature.')
+            if cfg.evidence_proto_update_type != 'evidence_weighted':
+                raise ValueError(f'evidence_proto_update_type should be evidence_weighted, got {cfg.evidence_proto_update_type}.')
+            if cfg.evidence_proto_update_weight_type != 'evidence_rank_x_pori':
+                raise ValueError('EAPA v1 requires evidence_rank_x_pori update weight.')
+            if cfg.evidence_proto_loss_type != 'proto_softmax':
+                raise ValueError(f'evidence_proto_loss_type should be proto_softmax, got {cfg.evidence_proto_loss_type}.')
+            if cfg.evidence_proto_loss_targets != 'clean':
+                raise ValueError(f'evidence_proto_loss_targets should be clean, got {cfg.evidence_proto_loss_targets}.')
+            if cfg.evidence_proto_num_subproto != 1:
+                raise ValueError('EAPA v1 only supports one prototype per class.')
+            if cfg.evidence_proto_update_start_epoch < 0 or cfg.evidence_proto_loss_start_epoch < 0:
+                raise ValueError('EAPA update/loss start epochs should be non-negative.')
+            if cfg.evidence_proto_loss_start_epoch < cfg.evidence_proto_update_start_epoch:
+                raise ValueError('EAPA loss_start_epoch should be >= update_start_epoch.')
+            if cfg.evidence_proto_momentum < 0.0 or cfg.evidence_proto_momentum >= 1.0:
+                raise ValueError('evidence_proto_momentum should be in [0, 1).')
+            if not (0.0 <= cfg.evidence_proto_update_conf_thr <= 1.0):
+                raise ValueError('evidence_proto_update_conf_thr should be within [0, 1].')
+            if cfg.evidence_proto_weight < 0.0 or cfg.evidence_proto_temp <= 0.0:
+                raise ValueError('evidence_proto_weight should be non-negative and temp should be positive.')
+        if cfg.normal_proto_align:
+            if cfg.normal_proto_update_groups != 'clean':
+                raise ValueError(f'normal_proto_update_groups should be clean, got {cfg.normal_proto_update_groups}.')
+            if cfg.normal_proto_update_weight_type != 'pori':
+                raise ValueError('normal prototype v1 requires pori update weight.')
+            if cfg.normal_proto_loss_type != 'proto_softmax':
+                raise ValueError('normal prototype v1 requires proto_softmax loss.')
+            if cfg.normal_proto_update_start_epoch < 0 or cfg.normal_proto_loss_start_epoch < 0:
+                raise ValueError('normal prototype update/loss epochs should be non-negative.')
+            if cfg.normal_proto_loss_start_epoch < cfg.normal_proto_update_start_epoch:
+                raise ValueError('normal prototype loss_start_epoch should be >= update_start_epoch.')
+            if not (0.0 <= cfg.normal_proto_update_conf_thr <= 1.0):
+                raise ValueError('normal_proto_update_conf_thr should be within [0, 1].')
+            if cfg.normal_proto_weight < 0.0 or cfg.normal_proto_temp <= 0.0:
+                raise ValueError('normal_proto_weight should be non-negative and temp should be positive.')
     part_ce_writer = None
     part_ce_gate_sample_writer = None
     if cfg.part_ce and cfg.part_ce_log:
@@ -699,6 +777,10 @@ def main(gpu, cfg):
             filename='d2_diag_samples.csv',
             header=D2_DIAG_SAMPLE_CSV_HEADER,
         )
+    evidence_proto_writer = None
+    if prototype_enabled and ((cfg.evidence_proto_align and cfg.evidence_proto_log) or (cfg.normal_proto_align and cfg.normal_proto_log)):
+        # EAPA/normal prototype 共用 CSV，记录 prototype softmax、更新权重和 bank 覆盖率。
+        evidence_proto_writer = Writer(root_dir=result_dir, filename='evidence_proto.csv', header=EVIDENCE_PROTO_CSV_HEADER)
     if 'webvision' in cfg.dataset:
         test_acc_writer = Writer(root_dir=result_dir, filename='test_acc.csv', header='epoch,Top1Acc,Top5Acc,ImagenetTop1Acc,ImagenetTop5Acc')
     else:
@@ -735,6 +817,7 @@ def main(gpu, cfg):
     queue_logits = torch.randn(cfg.queue_length, cfg.n_classes).to(device)
     queue_ptr  = 0
     loss_contrastive_func = SupConLoss(temperature=0.1, base_temperature=0.1)
+    prototype_state = init_prototype_state(cfg.n_classes, cfg.fdim, device) if prototype_enabled else None
 
     if cfg.cls4id == 'ce':
         id_loss_func = F.cross_entropy
@@ -758,6 +841,9 @@ def main(gpu, cfg):
             tau_o = resume_checkpoint['tau_o'].to(device)
         if 'scaler_state_dict' in resume_checkpoint:
             scaler.load_state_dict(resume_checkpoint['scaler_state_dict'])
+        if prototype_state is not None:
+            # 续跑必须恢复 prototype bank，否则 epoch30 后的 proto loss 会读取到空 bank。
+            load_prototype_state(prototype_state, resume_checkpoint, device)
     for epoch in range(start_epoch, cfg.epochs):
         if cfg.warmup_fc_only:
             if epoch < cfg.warmup_epochs:
@@ -895,10 +981,28 @@ def main(gpu, cfg):
                     clean_loss_weight = torch.ones_like(losses_cls_clean)
                     raw_clean_losses = losses_cls_clean.detach()
                     clean_part_batch = {'num_selected': int(idx_clean.numel()), 'num_valid': 0}
+                    proto_update_info, proto_update_result, proto_loss_result = None, None, None
+                    proto_base_loss = None
                     run_evidence_clean_reweight = (
                         cfg.evidence_clean_reweight
                         and (epoch + 1) >= cfg.evidence_clean_reweight_start_epoch
                         and (epoch + 1) >= cfg.part_ce_gate_start_epoch
+                    )
+                    run_evidence_proto_update = (
+                        cfg.evidence_proto_align
+                        and (epoch + 1) >= max(cfg.local_evidence_start_epoch, cfg.evidence_proto_update_start_epoch)
+                    )
+                    run_evidence_proto_loss = (
+                        cfg.evidence_proto_align
+                        and (epoch + 1) >= cfg.evidence_proto_loss_start_epoch
+                    )
+                    run_normal_proto_update = (
+                        cfg.normal_proto_align
+                        and (epoch + 1) >= cfg.normal_proto_update_start_epoch
+                    )
+                    run_normal_proto_loss = (
+                        cfg.normal_proto_align
+                        and (epoch + 1) >= cfg.normal_proto_loss_start_epoch
                     )
                     run_part_consistency = (
                         cfg.part_consistency
@@ -918,11 +1022,15 @@ def main(gpu, cfg):
                         cfg.part_ce
                         or cfg.local_margin
                         or run_evidence_clean_reweight
+                        or run_evidence_proto_update
                         or run_part_consistency
                         or run_erase_consistency
                     )
                     if need_clean_part_gate and idx_clean.numel() > 0:
-                        cam_model = k_model if cfg.part_ce_use_teacher_cam else q_model
+                        use_teacher_cam = cfg.part_ce_use_teacher_cam
+                        if cfg.evidence_proto_align:
+                            use_teacher_cam = cfg.evidence_proto_update_feature == 'teacher_ema'
+                        cam_model = k_model if use_teacher_cam else q_model
                         clean_part_batch = build_local_part_batch(
                             cam_model, x1, y, idx_clean,
                             cam_quantile=cfg.local_evidence_cam_quantile,
@@ -1160,6 +1268,105 @@ def main(gpu, cfg):
                             skip_reason=erase_consistency_skip_reason,
                         )
                         erase_consistency_writer.write(format_erase_consistency_row(erase_consistency_row))
+
+                    if prototype_enabled:
+                        if cfg.evidence_proto_align:
+                            proto_weight = cfg.evidence_proto_weight
+                            proto_temp = cfg.evidence_proto_temp
+                            update_conf_thr = cfg.evidence_proto_update_conf_thr
+                            run_proto_loss = run_evidence_proto_loss
+                            run_proto_update = run_evidence_proto_update
+                        else:
+                            proto_weight = cfg.normal_proto_weight
+                            proto_temp = cfg.normal_proto_temp
+                            update_conf_thr = cfg.normal_proto_update_conf_thr
+                            run_proto_loss = run_normal_proto_loss
+                            run_proto_update = run_normal_proto_update
+
+                        proto_base_loss = loss.detach()
+                        if run_proto_loss:
+                            # Prototype softmax 只读取历史 bank；未初始化类别在 helper 内用 -inf mask 排除。
+                            proto_loss_result = compute_prototype_softmax_loss(
+                                q, y, idx_clean, prototype_state, temperature=proto_temp
+                            )
+                            if int(proto_loss_result.get('num_proto_loss_valid', 0)) > 0:
+                                loss = loss + proto_weight * proto_loss_result['loss']
+                        else:
+                            proto_loss_result = {
+                                'loss': loss.new_tensor(0.0),
+                                'num_proto_loss_valid': 0,
+                                'proto_ce_raw': 0.0,
+                                'proto_target_prob_mean': 0.0,
+                                'proto_target_logit_mean': 0.0,
+                                'proto_max_non_target_prob_mean': 0.0,
+                                'proto_entropy_mean': 0.0,
+                                'nearest_proto_acc': 0.0,
+                                'target_proto_available_ratio': 0.0,
+                                'skip_reason': 'loss_not_started',
+                            }
+
+                        if run_proto_update:
+                            if cfg.evidence_proto_align:
+                                # EAPA 只在 update candidates 内做 evidence rank，低置信 clean 不参与排序。
+                                proto_update_info = compute_evidence_update_weights(
+                                    clean_part_batch,
+                                    conf_thr=update_conf_thr,
+                                )
+                                candidate_mask = proto_update_info.get('candidate_mask')
+                                if candidate_mask is not None and int(candidate_mask.sum().item()) > 0:
+                                    candidate_mask = candidate_mask.to(device=x1.device, dtype=torch.bool)
+                                    update_positions = clean_part_batch['batch_indices'][candidate_mask]
+                                    update_labels = clean_part_batch['labels'][candidate_mask]
+                                    update_weights = proto_update_info['weights'][candidate_mask]
+                                    proto_update_result = update_prototype_bank_weighted(
+                                        prototype_state,
+                                        ema_feat1[update_positions],
+                                        update_labels,
+                                        update_weights,
+                                        momentum=cfg.evidence_proto_momentum,
+                                    )
+                                else:
+                                    proto_update_result = {
+                                        'num_proto_update': 0,
+                                        'prototype_drift_mean': 0.0,
+                                        'prototype_drift_max': 0.0,
+                                    }
+                            else:
+                                # Normal prototype 对照只用 teacher 全图置信度更新，不计算局部 evidence。
+                                proto_update_info = compute_confidence_update_weights(
+                                    y, idx_clean, ema_logits1, conf_thr=update_conf_thr
+                                )
+                                if int(proto_update_info.get('num_update_candidate', 0)) > 0:
+                                    update_positions = proto_update_info['batch_indices']
+                                    proto_update_result = update_prototype_bank_weighted(
+                                        prototype_state,
+                                        ema_feat1[update_positions],
+                                        proto_update_info['labels'],
+                                        proto_update_info['weights'],
+                                        momentum=cfg.evidence_proto_momentum,
+                                    )
+                                else:
+                                    proto_update_result = {
+                                        'num_proto_update': 0,
+                                        'prototype_drift_mean': 0.0,
+                                        'prototype_drift_max': 0.0,
+                                    }
+                        else:
+                            proto_update_info = {'skip_reason': 'update_not_started'}
+                            proto_update_result = {
+                                'num_proto_update': 0,
+                                'prototype_drift_mean': 0.0,
+                                'prototype_drift_max': 0.0,
+                            }
+
+                        if evidence_proto_writer is not None:
+                            proto_row = build_evidence_proto_log_row(
+                                epoch + 1, it, int(idx_clean.numel()),
+                                int(clean_part_batch.get('num_valid', 0)) if cfg.evidence_proto_align else 0,
+                                proto_update_info, proto_update_result, proto_loss_result,
+                                prototype_state, proto_weight, proto_temp, proto_base_loss,
+                            )
+                            evidence_proto_writer.write(format_evidence_proto_row(proto_row))
 
                     if cfg.id_candidate:
                         id_candidate_loss = loss.new_tensor(0.0)
@@ -1429,7 +1636,8 @@ def main(gpu, cfg):
                 'tau_c': tau_c.detach().cpu(),
                 'tau_o': tau_o.detach().cpu(),
                 'best_epoch': best_epoch,
-                'best_accuracy': best_accuracy
+                'best_accuracy': best_accuracy,
+                **prototype_checkpoint_items(prototype_state)
             }, filename=os.path.join(result_dir, f'checkpoint-{ckpt_file_suffix}.pth'))
 
         # evaluate this epoch
@@ -1509,6 +1717,8 @@ def check_args(args):
         'local_evidence_min_area', 'local_evidence_max_area',
         'local_evidence_bbox_padding', 'local_evidence_cam_type',
         'local_evidence_save_images', 'local_evidence_image_max_samples',
+        'local_evidence_start_epoch', 'local_evidence_score_type',
+        'local_evidence_rank_scope',
         'part_ce', 'part_ce_weight', 'part_ce_groups', 'part_ce_use_teacher_cam', 'part_ce_log',
         'part_ce_gate', 'part_ce_gate_type', 'part_ce_gate_threshold',
         'part_ce_gate_keep_ratio', 'part_ce_gate_start_epoch',
@@ -1554,7 +1764,24 @@ def check_args(args):
         'd2_diag_use_teacher_for_quality', 'd2_diag_use_student_for_logits',
         'multi_part_quality_metric', 'multi_part_quality_gate_type',
         'multi_part_quality_keep_ratio', 'multi_part_iou_filter',
-        'multi_part_iou_thr'
+        'multi_part_iou_thr',
+        'evidence_proto_align', 'evidence_proto_groups',
+        'evidence_proto_require_c1_gate', 'evidence_proto_bank',
+        'evidence_proto_feature', 'evidence_proto_feature_dim',
+        'evidence_proto_momentum', 'evidence_proto_normalize',
+        'evidence_proto_init', 'evidence_proto_update_feature',
+        'evidence_proto_loss_feature', 'evidence_proto_update_start_epoch',
+        'evidence_proto_update_type', 'evidence_proto_update_conf_thr',
+        'evidence_proto_update_weight_type', 'evidence_proto_loss_start_epoch',
+        'evidence_proto_loss_type', 'evidence_proto_weight',
+        'evidence_proto_temp', 'evidence_proto_loss_targets',
+        'evidence_proto_margin', 'evidence_proto_hard_negative',
+        'evidence_proto_num_subproto', 'evidence_proto_log',
+        'normal_proto_align', 'normal_proto_update_groups',
+        'normal_proto_update_start_epoch', 'normal_proto_update_conf_thr',
+        'normal_proto_update_weight_type', 'normal_proto_loss_start_epoch',
+        'normal_proto_loss_type', 'normal_proto_temp', 'normal_proto_weight',
+        'normal_proto_log'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -1648,6 +1875,12 @@ def parse_args():
                         help='保存 A1 可视化 PNG：原图+bbox、CAM 叠加、局部图、擦除图。')
     parser.add_argument('--local-evidence-image-max-samples', type=int, default=None,
                         help='每个触发 batch 最多保存多少张 A1 可视化图片。')
+    parser.add_argument('--local-evidence-start-epoch', type=int, default=None,
+                        help='EAPA 复用 C1 evidence 计算的起始 epoch；不等同于 A1 诊断开关。')
+    parser.add_argument('--local-evidence-score-type', type=str, default=None,
+                        help='EAPA 局部证据分数类型；第一版只支持 c1。')
+    parser.add_argument('--local-evidence-rank-scope', type=str, default=None,
+                        help='EAPA evidence rank 归一化范围；第一版只支持 batch_update_candidates。')
 
     # B1/C1 局部 CE：C1 在 B1 的 clean 局部 CE 前增加 evidence gate。
     parser.add_argument('--part-ce', action='store_true', default=None,
@@ -1867,6 +2100,28 @@ def parse_args():
     parser.add_argument('--multi-part-iou-thr', type=float, default=None,
                         help='D2_diag IoU 去重阈值。')
 
+    # EAPA：用局部证据做 prototype update 软权重，再用 prototype softmax 约束全图特征。
+    parser.add_argument('--evidence-proto-align', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 EAPA evidence-weighted prototype softmax 分支。')
+    parser.add_argument('--evidence-proto-weight', type=float, default=None,
+                        help='EAPA prototype softmax loss 权重。')
+    parser.add_argument('--evidence-proto-temp', type=float, default=None,
+                        help='EAPA prototype softmax temperature。')
+    parser.add_argument('--evidence-proto-update-conf-thr', type=float, default=None,
+                        help='EAPA prototype update 的 p_ori_y 最低门槛。')
+    parser.add_argument('--evidence-proto-update-start-epoch', type=int, default=None,
+                        help='EAPA 从第几个用户可见 epoch 开始更新 prototype。')
+    parser.add_argument('--evidence-proto-loss-start-epoch', type=int, default=None,
+                        help='EAPA 从第几个用户可见 epoch 开始加入 prototype softmax loss。')
+
+    # Normal prototype 对照：只用 clean confidence 更新 prototype，不计算局部 evidence。
+    parser.add_argument('--normal-proto-align', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 normal clean prototype softmax 对照。')
+    parser.add_argument('--normal-proto-weight', type=float, default=None,
+                        help='normal prototype softmax loss 权重。')
+    parser.add_argument('--normal-proto-temp', type=float, default=None,
+                        help='normal prototype softmax temperature。')
+
     parsed_args = parser.parse_args()
     cfg_path = parsed_args.cfg
     gpu = parsed_args.gpu
@@ -1919,6 +2174,9 @@ def parse_args():
     args.setdefault('local_evidence_cam_type', 'weightcam')
     args.setdefault('local_evidence_save_images', False)
     args.setdefault('local_evidence_image_max_samples', 8)
+    args.setdefault('local_evidence_start_epoch', 20)
+    args.setdefault('local_evidence_score_type', 'c1')
+    args.setdefault('local_evidence_rank_scope', 'batch_update_candidates')
     # B1/C1 默认关闭；开启后无需同时开启 A1 local_evidence，也会独立写 part_ce.csv。
     args.setdefault('part_ce', False)
     args.setdefault('part_ce_weight', 0.5)
@@ -2027,8 +2285,46 @@ def parse_args():
     args.setdefault('multi_part_quality_keep_ratio', 0.5)
     args.setdefault('multi_part_iou_filter', True)
     args.setdefault('multi_part_iou_thr', 0.5)
+    # EAPA 默认关闭；开启后只用 C1 evidence 作为 prototype update 软权重，不启用局部 CE。
+    args.setdefault('evidence_proto_align', False)
+    args.setdefault('evidence_proto_groups', 'clean')
+    args.setdefault('evidence_proto_require_c1_gate', False)
+    args.setdefault('evidence_proto_bank', True)
+    args.setdefault('evidence_proto_feature', 'projected')
+    args.setdefault('evidence_proto_feature_dim', args['fdim'])
+    args.setdefault('evidence_proto_momentum', 0.90)
+    args.setdefault('evidence_proto_normalize', True)
+    args.setdefault('evidence_proto_init', 'zero')
+    args.setdefault('evidence_proto_update_feature', 'teacher_ema')
+    args.setdefault('evidence_proto_loss_feature', 'student')
+    args.setdefault('evidence_proto_update_start_epoch', 20)
+    args.setdefault('evidence_proto_update_type', 'evidence_weighted')
+    args.setdefault('evidence_proto_update_conf_thr', 0.60)
+    args.setdefault('evidence_proto_update_weight_type', 'evidence_rank_x_pori')
+    args.setdefault('evidence_proto_loss_start_epoch', 30)
+    args.setdefault('evidence_proto_loss_type', 'proto_softmax')
+    args.setdefault('evidence_proto_weight', 0.02)
+    args.setdefault('evidence_proto_temp', 0.2)
+    args.setdefault('evidence_proto_loss_targets', 'clean')
+    args.setdefault('evidence_proto_margin', None)
+    args.setdefault('evidence_proto_hard_negative', None)
+    args.setdefault('evidence_proto_num_subproto', 1)
+    args.setdefault('evidence_proto_log', True)
+    # Normal prototype 对照默认关闭；与 EAPA 共享 prototype softmax 实现。
+    args.setdefault('normal_proto_align', False)
+    args.setdefault('normal_proto_update_groups', 'clean')
+    args.setdefault('normal_proto_update_start_epoch', 20)
+    args.setdefault('normal_proto_update_conf_thr', 0.60)
+    args.setdefault('normal_proto_update_weight_type', 'pori')
+    args.setdefault('normal_proto_loss_start_epoch', 30)
+    args.setdefault('normal_proto_loss_type', 'proto_softmax')
+    args.setdefault('normal_proto_temp', 0.2)
+    args.setdefault('normal_proto_weight', 0.02)
+    args.setdefault('normal_proto_log', True)
     # C1/C2/D1 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
+    args['local_evidence_score_type'] = str(args['local_evidence_score_type']).strip().lower()
+    args['local_evidence_rank_scope'] = str(args['local_evidence_rank_scope']).strip().lower()
     args['local_margin_groups'] = str(args['local_margin_groups']).strip().lower()
     args['local_margin_hard_negative'] = str(args['local_margin_hard_negative']).strip().lower()
     args['part_consistency_groups'] = str(args['part_consistency_groups']).strip().lower()
@@ -2050,6 +2346,18 @@ def parse_args():
     args['d2_diag_groups'] = str(args['d2_diag_groups']).strip().lower()
     args['multi_part_quality_metric'] = str(args['multi_part_quality_metric']).lower()
     args['multi_part_quality_gate_type'] = str(args['multi_part_quality_gate_type']).lower()
+    args['evidence_proto_groups'] = str(args['evidence_proto_groups']).strip().lower()
+    args['evidence_proto_feature'] = str(args['evidence_proto_feature']).strip().lower()
+    args['evidence_proto_init'] = str(args['evidence_proto_init']).strip().lower()
+    args['evidence_proto_update_feature'] = str(args['evidence_proto_update_feature']).strip().lower()
+    args['evidence_proto_loss_feature'] = str(args['evidence_proto_loss_feature']).strip().lower()
+    args['evidence_proto_update_type'] = str(args['evidence_proto_update_type']).strip().lower()
+    args['evidence_proto_update_weight_type'] = str(args['evidence_proto_update_weight_type']).strip().lower()
+    args['evidence_proto_loss_type'] = str(args['evidence_proto_loss_type']).strip().lower()
+    args['evidence_proto_loss_targets'] = str(args['evidence_proto_loss_targets']).strip().lower()
+    args['normal_proto_update_groups'] = str(args['normal_proto_update_groups']).strip().lower()
+    args['normal_proto_update_weight_type'] = str(args['normal_proto_update_weight_type']).strip().lower()
+    args['normal_proto_loss_type'] = str(args['normal_proto_loss_type']).strip().lower()
     if isinstance(args['d2_diag_aggregation'], str):
         args['d2_diag_aggregation'] = [
             item.strip().lower()

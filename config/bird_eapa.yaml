@@ -1,0 +1,110 @@
+# dataset
+data_root: /root/autodl-tmp/          # 数据集根目录；实际读取 /root/autodl-tmp/web-bird/
+dataset: web-bird                    # 数据集名称，同时作为 data_root 下的子目录名
+n_classes: 200                       # Web-Bird 类别数
+rescale_size: 448                    # 图像先 resize 到的短边/目标尺寸
+crop_size: 448                       # 训练和测试裁剪尺寸
+
+# network & optimization
+arch: resnet50                       # 主干网络；WebFG 实验使用 ResNet50
+opt: sgd                             # 优化器类型
+batch_size: 56                       # 单卡 batch size；按显存设置
+epochs: 120                          # 总训练轮数
+lr: 0.00875                          # 主学习率
+lr_decay: cosine:10                  # 学习率衰减策略
+warmup_epochs: 5                     # Jo-SNC warmup 轮数
+warmup_lr: 0.00875                   # warmup 阶段学习率
+warmup_lr_plan: constant             # warmup 学习率计划
+weight_decay: 1.0e-5                 # 权重衰减
+use_fp16: true                       # 是否启用 AMP 混合精度
+
+# Jo-SNC hyper-params
+eps: 0.3                             # label smoothing 系数
+alpha: 0.3                           # prediction consistency loss 权重
+beta: 0.8                            # NCR loss 权重
+gamma: 0.001                         # feature contrastive loss 权重
+delta: 0.0                           # 阈值更新放大因子
+fdim: 256                            # projector 输出特征维度；EAPA-v1 prototype 使用该维度
+hdim: 2                              # classifier MLP hidden scale
+queue_length: 32000                  # MoCo/NCR 队列长度
+knet_m: 0.99                         # EMA teacher 动量
+n_neighbors: 10                      # NCR 近邻数量
+topK: 10                             # PLL 候选标签 topK
+topK_decay: 1000                     # topK 衰减周期；1000 基本等于不衰减
+tau_m: 0.98                          # clean/OOD 阈值 EMA 动量
+transform: strong                    # 使用 strong augmentation
+cls4ood: nl                          # OOD noisy 样本 loss 类型
+cls4id: ce                           # ID noisy 样本 loss 类型
+ncr_lossfunc: kldiv                  # NCR 内部距离/散度形式
+integrate_mode: or                   # self/neighbor clean 判定合并方式
+ood_criterion: div                   # OOD 判定标准
+threshold_generator: per_class_mean  # 每类均值生成阈值
+conf_weight: true                    # 是否使用置信度权重
+
+# EAPA 内部复用 C1 local evidence 计算；A1 只读诊断默认关闭。
+local_evidence: false                # 是否额外写 A1 local_evidence.csv；EAPA 内部不依赖该诊断开关
+local_evidence_start_epoch: 20       # EAPA 开始计算局部 evidence 的用户可见 epoch
+local_evidence_score_type: c1        # 局部证据分数类型；v1 固定为 C1 evidence
+local_evidence_rank_scope: batch_update_candidates  # evidence rank 只在当前 batch update candidates 内计算
+local_evidence_every: 5              # A1 诊断频率；local_evidence=false 时不生效
+local_evidence_max_batches: 20       # A1 每个触发 epoch 最多诊断 batch 数
+local_evidence_cam_quantile: 0.85    # CAM 高响应区域分位阈值
+local_evidence_use_teacher: true     # A1 诊断是否使用 EMA teacher
+local_evidence_min_area: 0.05        # CAM bbox 最小面积比例
+local_evidence_max_area: 0.45        # CAM bbox 最大面积比例
+local_evidence_bbox_padding: 0.02    # CAM bbox padding 比例
+local_evidence_cam_type: weightcam   # CAM 类型；当前使用 weightcam
+local_evidence_save_images: false    # 是否保存 A1 可视化图片
+local_evidence_image_max_samples: 8  # 每个触发 batch 最多保存图片数
+
+# 关闭局部训练和其它诊断分支，保证 EAPA-v1 归因干净。
+part_ce: false                       # 关闭 C1/B1 局部 CE loss
+part_ce_weight: 0.5                  # 局部 CE 权重；part_ce=false 时不生效
+part_ce_groups: clean                # 局部 CE 分组；part_ce=false 时不生效
+part_ce_use_teacher_cam: true        # C1 helper 是否用 teacher 生成 CAM；EAPA 会使用 teacher evidence
+part_ce_log: true                    # C1 part_ce.csv 开关；part_ce=false 时不写
+part_ce_gate: false                  # 不启用 C1 hard gate；EAPA 使用 soft evidence weight
+part_ce_gate_type: percentile        # C1 hard gate 类型；EAPA-v1 不作为 update mask
+part_ce_gate_threshold: 0.10         # fixed gate 阈值；EAPA-v1 不使用
+part_ce_gate_keep_ratio: 0.50        # percentile gate 保留比例；EAPA weighted update 忽略该 hard mask
+part_ce_gate_start_epoch: 20         # C1 hard gate 起始 epoch；保留兼容旧 helper
+local_margin: false                  # 关闭 D3 local margin
+part_consistency: false              # 关闭 F1 global-to-part consistency
+erase_consistency: false             # 关闭 E4 erased-view consistency
+evidence_clean_reweight: false       # 关闭 E1 clean reweight
+id_candidate: false                  # 关闭 C2 ID candidate
+multi_part: false                    # 关闭 D1 multi-part 诊断
+d2_diag: false                       # 关闭 D2_diag 诊断
+
+# EAPA evidence-weighted prototype softmax
+evidence_proto_align: true           # 开启 EAPA-v1
+evidence_proto_groups: clean         # prototype loss/update 只作用 Jo-SNC clean 样本
+evidence_proto_require_c1_gate: false  # 不要求 C1 hard gate；只使用 evidence soft weight
+evidence_proto_bank: true            # 启用 prototype memory bank
+evidence_proto_feature: projected    # prototype 使用 projector 后的全图特征
+evidence_proto_feature_dim: 256      # prototype 特征维度，必须等于 fdim
+evidence_proto_momentum: 0.90        # prototype EMA 更新动量
+evidence_proto_normalize: true       # feature/prototype 归一化；v1 实现中始终归一化
+evidence_proto_init: zero            # prototype bank 初始化方式
+evidence_proto_update_feature: teacher_ema  # 使用 EMA teacher feature 更新 prototype
+evidence_proto_loss_feature: student # 使用 student feature 计算 prototype loss
+
+evidence_proto_update_start_epoch: 20  # 从该 epoch 开始只更新 prototype bank
+evidence_proto_update_type: evidence_weighted  # update 方式：局部证据加权
+evidence_proto_update_conf_thr: 0.60  # update candidate 的 p_ori_y 最低门槛
+evidence_proto_update_weight_type: evidence_rank_x_pori  # update 权重 rank_norm(e_i) * p_ori_y
+
+evidence_proto_loss_start_epoch: 30   # 从该 epoch 开始加入 prototype softmax loss
+evidence_proto_loss_type: proto_softmax  # prototype 对齐 loss 类型
+evidence_proto_weight: 0.02           # prototype softmax loss 权重
+evidence_proto_temp: 0.2              # prototype softmax temperature
+evidence_proto_loss_targets: clean    # prototype loss 作用对象：Jo-SNC clean
+evidence_proto_margin: null           # margin 版保留字段；softmax v1 不使用
+evidence_proto_hard_negative: null    # hard negative 保留字段；softmax v1 不使用
+evidence_proto_num_subproto: 1        # 每类 prototype 数；v1 固定为 1
+evidence_proto_log: true              # 是否写 evidence_proto.csv
+
+# logging
+log_root: ./results/                  # 结果根目录
+log_proj: benchmark_webfg             # 日志项目名；benchmark 目录规则
+log_name: web-bird-EAPA-projected-softmax-w002-t02  # 单次实验名
