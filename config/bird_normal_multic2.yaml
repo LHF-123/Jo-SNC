@@ -1,0 +1,96 @@
+# dataset
+data_root: /root/autodl-tmp/          # 数据集根目录；实际读取 /root/autodl-tmp/web-bird/
+dataset: web-bird                    # 数据集名称，同时作为 data_root 下的子目录名
+n_classes: 200                       # Web-Bird 类别数
+rescale_size: 448                    # 输入图像 resize 尺寸
+crop_size: 448                       # 训练和测试裁剪尺寸
+
+# network & optimization
+arch: resnet50                       # WebFG 实验使用 ResNet50
+opt: sgd                             # 优化器类型
+batch_size: 56                       # 单卡 batch size
+epochs: 120                          # 总训练轮数
+lr: 0.00875                          # 主学习率
+lr_decay: cosine:10                  # 学习率衰减策略
+warmup_epochs: 5                     # Jo-SNC warmup 轮数
+warmup_lr: 0.00875                   # warmup 阶段学习率
+warmup_lr_plan: constant             # warmup 学习率计划
+weight_decay: 1.0e-5                 # 权重衰减
+use_fp16: true                       # 启用 AMP 混合精度
+
+# Jo-SNC hyper-params
+eps: 0.3                             # label smoothing 系数
+alpha: 0.3                           # prediction consistency loss 权重
+beta: 0.8                            # NCR loss 权重
+gamma: 0.001                         # feature contrastive loss 权重
+delta: 0.0                           # 阈值更新放大因子
+fdim: 256                            # projector 输出特征维度；prototype 使用该维度
+hdim: 2                              # classifier MLP hidden scale
+queue_length: 32000                  # MoCo/NCR 队列长度
+knet_m: 0.99                         # EMA teacher 动量
+n_neighbors: 10                      # NCR 近邻数量
+topK: 10                             # PLL 候选标签 topK
+topK_decay: 1000                     # topK 衰减周期；1000 基本等于不衰减
+tau_m: 0.98                          # clean/OOD 阈值 EMA 动量
+transform: strong                    # 使用 strong augmentation
+cls4ood: nl                          # OOD noisy 样本 loss 类型
+cls4id: ce                           # ID noisy 样本 loss 类型
+ncr_lossfunc: kldiv                  # NCR 内部距离/散度形式
+integrate_mode: or                   # self/neighbor clean 判定合并方式
+ood_criterion: div                   # OOD 判定标准
+threshold_generator: per_class_mean  # 每类均值生成阈值
+conf_weight: true                    # 使用置信度权重
+
+# local evidence compatibility
+local_evidence: false                # Normal prototype 不计算局部证据诊断
+local_evidence_start_epoch: 20       # 保留兼容字段；normal 分支不使用 evidence update
+local_evidence_score_type: c1        # 保留兼容字段；prototype 代码要求 c1
+local_evidence_rank_scope: batch_update_candidates  # 保留兼容字段；prototype 代码要求该 rank 范围
+local_evidence_every: 5              # A1 诊断频率；local_evidence=false 时不生效
+local_evidence_max_batches: 20       # A1 每个触发 epoch 最大诊断 batch 数
+local_evidence_cam_quantile: 0.85    # CAM 高响应区域分位阈值；normal prototype 不使用
+local_evidence_use_teacher: true     # A1 诊断是否使用 EMA teacher
+local_evidence_min_area: 0.05        # CAM bbox 最小面积比例
+local_evidence_max_area: 0.45        # CAM bbox 最大面积比例
+local_evidence_bbox_padding: 0.02    # CAM bbox padding 比例
+local_evidence_cam_type: weightcam   # CAM 类型
+local_evidence_save_images: false    # 不保存 A1 可视化图像
+local_evidence_image_max_samples: 8  # 每个触发 batch 最大保存图像数
+
+# branch isolation
+part_ce: false                       # 关闭 C1/B1 局部 CE loss
+part_ce_gate: false                  # 关闭 C1 hard gate
+local_margin: false                  # 关闭 D3 local margin
+part_consistency: false              # 关闭 F1 global-to-part consistency
+erase_consistency: false             # 关闭 E4 erased-view consistency
+evidence_clean_reweight: false       # 关闭 E1 clean reweight
+id_candidate: false                  # 关闭 C2 ID candidate
+multi_part: false                    # 关闭 D1 multi-part 诊断
+d2_diag: false                       # 关闭 D2_diag 诊断
+
+# Normal multi-centroid prototype softmax
+normal_proto_align: true             # 开启 normal clean prototype 对照
+normal_proto_update_groups: clean    # update 只使用 Jo-SNC clean 样本
+normal_proto_update_start_epoch: 20  # 从该 epoch 开始只更新 prototype bank
+normal_proto_update_conf_thr: 0.60   # update candidate 的 p_ori_y 最低门槛
+normal_proto_update_weight_type: pori  # update 权重 w_i = p_ori_y
+normal_proto_num_subproto: 2         # 每类两个 sub-prototype，用于验证类内多模态容量
+normal_proto_class_logit_pool: max   # 类别 logit 使用 max-over-K，不把 C*K 当类别
+normal_proto_update_assign: nearest_same_class  # 样本分配给本类最近 sub-prototype
+normal_proto_init_policy: fill_empty_first      # 本类存在空 sub-prototype 时优先初始化空位
+normal_proto_loss_start_epoch: 30    # 从该 epoch 开始加入 prototype softmax loss
+normal_proto_loss_type: proto_softmax  # prototype 对齐 loss 类型
+normal_proto_temp: 0.2               # prototype softmax temperature
+normal_proto_weight: 0.05            # K=2 第一轮使用稍强但不极端的 proto loss 权重
+normal_proto_log: true               # 写 evidence_proto.csv 诊断
+
+# shared prototype bank options
+evidence_proto_align: false          # 关闭 EAPA evidence-weighted prototype
+evidence_proto_momentum: 0.90        # prototype EMA 更新动量；normal 分支复用该底层字段
+evidence_proto_feature: projected    # prototype 使用 projector 后的全图特征
+evidence_proto_feature_dim: 256      # prototype 特征维度，必须等于 fdim
+
+# logging
+log_root: ./results/                 # 结果根目录
+log_proj: benchmark_webfg            # 日志项目名
+log_name: web-bird-normal-multic2-softmax-w005-t02  # 单次实验名

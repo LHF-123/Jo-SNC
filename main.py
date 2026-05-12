@@ -667,8 +667,14 @@ def main(gpu, cfg):
                 raise ValueError(f'evidence_proto_loss_type should be proto_softmax, got {cfg.evidence_proto_loss_type}.')
             if cfg.evidence_proto_loss_targets != 'clean':
                 raise ValueError(f'evidence_proto_loss_targets should be clean, got {cfg.evidence_proto_loss_targets}.')
-            if cfg.evidence_proto_num_subproto != 1:
-                raise ValueError('EAPA v1 only supports one prototype per class.')
+            if cfg.evidence_proto_num_subproto not in [1, 2]:
+                raise ValueError('EAPA prototype currently supports evidence_proto_num_subproto in {1, 2}.')
+            if cfg.evidence_proto_class_logit_pool != 'max':
+                raise ValueError('EAPA multi-centroid prototype requires class_logit_pool=max.')
+            if cfg.evidence_proto_update_assign != 'nearest_same_class':
+                raise ValueError('EAPA multi-centroid prototype requires update_assign=nearest_same_class.')
+            if cfg.evidence_proto_init_policy != 'fill_empty_first':
+                raise ValueError('EAPA multi-centroid prototype requires init_policy=fill_empty_first.')
             if cfg.evidence_proto_update_start_epoch < 0 or cfg.evidence_proto_loss_start_epoch < 0:
                 raise ValueError('EAPA update/loss start epochs should be non-negative.')
             if cfg.evidence_proto_loss_start_epoch < cfg.evidence_proto_update_start_epoch:
@@ -694,6 +700,31 @@ def main(gpu, cfg):
                 raise ValueError('normal_proto_update_conf_thr should be within [0, 1].')
             if cfg.normal_proto_weight < 0.0 or cfg.normal_proto_temp <= 0.0:
                 raise ValueError('normal_proto_weight should be non-negative and temp should be positive.')
+            if cfg.normal_proto_num_subproto not in [1, 2]:
+                raise ValueError('normal prototype currently supports normal_proto_num_subproto in {1, 2}.')
+            if cfg.normal_proto_class_logit_pool != 'max':
+                raise ValueError('normal multi-centroid prototype requires class_logit_pool=max.')
+            if cfg.normal_proto_update_assign != 'nearest_same_class':
+                raise ValueError('normal multi-centroid prototype requires update_assign=nearest_same_class.')
+            if cfg.normal_proto_init_policy != 'fill_empty_first':
+                raise ValueError('normal multi-centroid prototype requires init_policy=fill_empty_first.')
+    if cfg.evidence_proto_align:
+        # 训练主循环只读取 active prototype 配置，避免在 loss/update 位置分散 K=1/K=2 分支。
+        proto_num_subproto = cfg.evidence_proto_num_subproto
+        proto_class_logit_pool = cfg.evidence_proto_class_logit_pool
+        proto_update_assign = cfg.evidence_proto_update_assign
+        proto_init_policy = cfg.evidence_proto_init_policy
+    elif cfg.normal_proto_align:
+        # Normal 对照复用同一套 prototype helper，仅替换 update 权重来源。
+        proto_num_subproto = cfg.normal_proto_num_subproto
+        proto_class_logit_pool = cfg.normal_proto_class_logit_pool
+        proto_update_assign = cfg.normal_proto_update_assign
+        proto_init_policy = cfg.normal_proto_init_policy
+    else:
+        proto_num_subproto = 1
+        proto_class_logit_pool = 'max'
+        proto_update_assign = 'nearest_same_class'
+        proto_init_policy = 'fill_empty_first'
     part_ce_writer = None
     part_ce_gate_sample_writer = None
     if cfg.part_ce and cfg.part_ce_log:
@@ -817,7 +848,10 @@ def main(gpu, cfg):
     queue_logits = torch.randn(cfg.queue_length, cfg.n_classes).to(device)
     queue_ptr  = 0
     loss_contrastive_func = SupConLoss(temperature=0.1, base_temperature=0.1)
-    prototype_state = init_prototype_state(cfg.n_classes, cfg.fdim, device) if prototype_enabled else None
+    prototype_state = (
+        init_prototype_state(cfg.n_classes, cfg.fdim, device, num_subproto=proto_num_subproto)
+        if prototype_enabled else None
+    )
 
     if cfg.cls4id == 'ce':
         id_loss_func = F.cross_entropy
@@ -1287,7 +1321,9 @@ def main(gpu, cfg):
                         if run_proto_loss:
                             # Prototype softmax 只读取历史 bank；未初始化类别在 helper 内用 -inf mask 排除。
                             proto_loss_result = compute_prototype_softmax_loss(
-                                q, y, idx_clean, prototype_state, temperature=proto_temp
+                                q, y, idx_clean, prototype_state,
+                                temperature=proto_temp,
+                                class_logit_pool=proto_class_logit_pool,
                             )
                             if int(proto_loss_result.get('num_proto_loss_valid', 0)) > 0:
                                 loss = loss + proto_weight * proto_loss_result['loss']
@@ -1301,7 +1337,10 @@ def main(gpu, cfg):
                                 'proto_max_non_target_prob_mean': 0.0,
                                 'proto_entropy_mean': 0.0,
                                 'nearest_proto_acc': 0.0,
+                                'nearest_class_acc': 0.0,
                                 'target_proto_available_ratio': 0.0,
+                                'target_subproto_similarity_mean': 0.0,
+                                'target_subproto_margin_mean': 0.0,
                                 'skip_reason': 'loss_not_started',
                             }
 
@@ -1324,6 +1363,8 @@ def main(gpu, cfg):
                                         update_labels,
                                         update_weights,
                                         momentum=cfg.evidence_proto_momentum,
+                                        update_assign=proto_update_assign,
+                                        init_policy=proto_init_policy,
                                     )
                                 else:
                                     proto_update_result = {
@@ -1344,6 +1385,8 @@ def main(gpu, cfg):
                                         proto_update_info['labels'],
                                         proto_update_info['weights'],
                                         momentum=cfg.evidence_proto_momentum,
+                                        update_assign=proto_update_assign,
+                                        init_policy=proto_init_policy,
                                     )
                                 else:
                                     proto_update_result = {
@@ -1776,11 +1819,15 @@ def check_args(args):
         'evidence_proto_loss_type', 'evidence_proto_weight',
         'evidence_proto_temp', 'evidence_proto_loss_targets',
         'evidence_proto_margin', 'evidence_proto_hard_negative',
-        'evidence_proto_num_subproto', 'evidence_proto_log',
+        'evidence_proto_num_subproto', 'evidence_proto_class_logit_pool',
+        'evidence_proto_update_assign', 'evidence_proto_init_policy',
+        'evidence_proto_log',
         'normal_proto_align', 'normal_proto_update_groups',
         'normal_proto_update_start_epoch', 'normal_proto_update_conf_thr',
         'normal_proto_update_weight_type', 'normal_proto_loss_start_epoch',
         'normal_proto_loss_type', 'normal_proto_temp', 'normal_proto_weight',
+        'normal_proto_num_subproto', 'normal_proto_class_logit_pool',
+        'normal_proto_update_assign', 'normal_proto_init_policy',
         'normal_proto_log'
     ]
     invalid_arg_items = []
@@ -2309,6 +2356,9 @@ def parse_args():
     args.setdefault('evidence_proto_margin', None)
     args.setdefault('evidence_proto_hard_negative', None)
     args.setdefault('evidence_proto_num_subproto', 1)
+    args.setdefault('evidence_proto_class_logit_pool', 'max')
+    args.setdefault('evidence_proto_update_assign', 'nearest_same_class')
+    args.setdefault('evidence_proto_init_policy', 'fill_empty_first')
     args.setdefault('evidence_proto_log', True)
     # Normal prototype 对照默认关闭；与 EAPA 共享 prototype softmax 实现。
     args.setdefault('normal_proto_align', False)
@@ -2320,6 +2370,10 @@ def parse_args():
     args.setdefault('normal_proto_loss_type', 'proto_softmax')
     args.setdefault('normal_proto_temp', 0.2)
     args.setdefault('normal_proto_weight', 0.02)
+    args.setdefault('normal_proto_num_subproto', 1)
+    args.setdefault('normal_proto_class_logit_pool', 'max')
+    args.setdefault('normal_proto_update_assign', 'nearest_same_class')
+    args.setdefault('normal_proto_init_policy', 'fill_empty_first')
     args.setdefault('normal_proto_log', True)
     # C1/C2/D1 字符串参数统一小写，避免 YAML/命令行大小写差异导致误判。
     args['part_ce_gate_type'] = str(args['part_ce_gate_type']).lower()
@@ -2355,9 +2409,15 @@ def parse_args():
     args['evidence_proto_update_weight_type'] = str(args['evidence_proto_update_weight_type']).strip().lower()
     args['evidence_proto_loss_type'] = str(args['evidence_proto_loss_type']).strip().lower()
     args['evidence_proto_loss_targets'] = str(args['evidence_proto_loss_targets']).strip().lower()
+    args['evidence_proto_class_logit_pool'] = str(args['evidence_proto_class_logit_pool']).strip().lower()
+    args['evidence_proto_update_assign'] = str(args['evidence_proto_update_assign']).strip().lower()
+    args['evidence_proto_init_policy'] = str(args['evidence_proto_init_policy']).strip().lower()
     args['normal_proto_update_groups'] = str(args['normal_proto_update_groups']).strip().lower()
     args['normal_proto_update_weight_type'] = str(args['normal_proto_update_weight_type']).strip().lower()
     args['normal_proto_loss_type'] = str(args['normal_proto_loss_type']).strip().lower()
+    args['normal_proto_class_logit_pool'] = str(args['normal_proto_class_logit_pool']).strip().lower()
+    args['normal_proto_update_assign'] = str(args['normal_proto_update_assign']).strip().lower()
+    args['normal_proto_init_policy'] = str(args['normal_proto_init_policy']).strip().lower()
     if isinstance(args['d2_diag_aggregation'], str):
         args['d2_diag_aggregation'] = [
             item.strip().lower()
