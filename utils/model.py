@@ -190,11 +190,15 @@ class DualHeadModel(nn.Module):
             feature_dim = self.encoder.feature_dim
         self.projector = MLPHead(self.encoder.feature_dim, 1, feature_dim, use_bn=use_bn)
 
-    def forward(self, x):
+    def forward(self, x, return_raw=False):
         fea = self.encoder(x)
         logits = self.classifier(fea)
         feat_c = self.projector(fea)
         if self.simsiam:
-            return logits, nn.functional.normalize(feat_c, dim=1), nn.functional.normalize(fea, dim=1)
+            outputs = (logits, nn.functional.normalize(feat_c, dim=1), nn.functional.normalize(fea, dim=1))
         else:
-            return logits, nn.functional.normalize(feat_c, dim=1)
+            outputs = (logits, nn.functional.normalize(feat_c, dim=1))
+        if return_raw:
+            # EG-PSSM 需要和 classifier 输入一致的 raw backbone feature；默认返回保持旧接口不变。
+            return (*outputs, fea)
+        return outputs

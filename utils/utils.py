@@ -59,7 +59,8 @@ def unfreeze_layer(module):
 
 def adjust_lr(optimizer, lr):
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        # EG-PSSM 使用分组学习率倍率；普通优化器没有 lr_scale 时仍保持原行为。
+        param_group['lr'] = lr * param_group.get('lr_scale', 1.0)
 
 
 def adjust_beta(optimizer, beta):

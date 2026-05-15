@@ -1,0 +1,87 @@
+# dataset
+data_root: /root/autodl-tmp/
+dataset: web-bird
+n_classes: 200
+rescale_size: 448
+crop_size: 448
+
+# network & optimization
+arch: resnet50
+opt: sgd
+batch_size: 56
+epochs: 120
+lr: 0.00875
+lr_decay: cosine:10
+warmup_epochs: 5
+warmup_lr: 0.00875
+warmup_lr_plan: constant
+weight_decay: 1.0e-5
+use_fp16: True
+
+# hyper-params
+eps: 0.3
+alpha: 0.3
+beta: 0.8
+gamma: 0.001
+delta: 0.0
+fdim: 256
+hdim: 2
+queue_length: 32000
+knet_m: 0.99
+n_neighbors: 10
+topK: 10
+topK_decay: 1000
+tau_m: 0.98
+transform: strong
+cls4ood: nl
+cls4id: ce
+ncr_lossfunc: kldiv
+integrate_mode: or
+ood_criterion: div
+threshold_generator: per_class_mean
+conf_weight: true
+eval_det: 0
+
+# CAM / part discovery
+local_evidence_cam_quantile: 0.85
+local_evidence_min_area: 0.05
+local_evidence_max_area: 0.45
+local_evidence_bbox_padding: 0.02
+local_evidence_cam_type: weightcam
+
+# Disable previous local/prototype branches for clean-only v1.
+part_ce: false
+local_margin: false
+part_consistency: false
+erase_consistency: false
+evidence_clean_reweight: false
+id_candidate: false
+multi_part: false
+d2_diag: false
+evidence_proto_align: false
+normal_proto_align: false
+
+# EG-PSSM no-gate ablation
+eg_pssm: true
+eg_pssm_backend: auto
+eg_pssm_num_parts: 3
+eg_pssm_use_diff_token: true
+eg_pssm_gate_mode: none
+eg_pssm_gate_min: 0.05
+eg_pssm_loss_weight: 0.2
+eg_pssm_start_epoch: 20
+eg_pssm_lambda_init: 0.001
+eg_pssm_bidirectional: true
+eg_pssm_sort_parts: evidence_desc
+eg_pssm_clean_only: true
+eg_pssm_log: true
+eg_pssm_init_ckpt_path: null
+eg_pssm_use_accum_erase: true
+eg_pssm_crop_mode: peak_window
+eg_pssm_window_ratio: 0.35
+eg_pssm_erase_mode: peak_window
+
+# logging
+log_root: ./results/
+log_proj: ''
+log_name: EG_PSSM_clean_only_no_gate

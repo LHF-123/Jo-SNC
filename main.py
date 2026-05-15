@@ -83,6 +83,15 @@ from utils.local_evidence import (
     format_part_ce_gate_sample_row,
     format_part_ce_row,
 )
+from utils.eg_pssm import (
+    EG_PSSM_CSV_HEADER,
+    EGPSSMModule,
+    build_eg_pssm_log_row,
+    build_eg_pssm_part_batch,
+    eg_pssm_checkpoint_items,
+    format_eg_pssm_row,
+    update_eg_pssm_grad_fields,
+)
 from utils.prototype import (
     EVIDENCE_PROTO_CSV_HEADER,
     build_evidence_proto_log_row,
@@ -161,6 +170,64 @@ def build_optimizer(cfg, net_params):
         return torch.optim.Adam(net_params, lr=cfg.lr, weight_decay=cfg.weight_decay)  # , betas=(0.9, 0.999), amsgrad=False)
     else:
         raise ValueError(f'{cfg.opt} optimizer is not supported.')
+
+
+def build_eg_pssm_param_groups(q_model, eg_pssm_module):
+    # EG-PSSM warm-start 训练使用分组学习率：backbone 慢调，分类头/投影头中速，SSM 分支快速适配。
+    return [
+        {
+            'params': [p for p in q_model.encoder.parameters() if p.requires_grad],
+            'lr_scale': 0.1,
+        },
+        {
+            'params': [
+                p for p in list(q_model.classifier.parameters()) + list(q_model.projector.parameters())
+                if p.requires_grad
+            ],
+            'lr_scale': 0.5,
+        },
+        {
+            'params': [p for p in eg_pssm_module.parameters() if p.requires_grad],
+            'lr_scale': 2.0,
+        },
+    ]
+
+
+def load_eg_pssm_warm_start(path, q_model, k_model, device, logger):
+    if path is None or str(path).strip() == '':
+        return None
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'eg_pssm_init_ckpt_path does not exist: {path}')
+    # warm-start 只初始化 q/k model 和队列相关状态，不恢复旧 optimizer。
+    logger.msg(f'EG-PSSM warm-start from {path}')
+    checkpoint = torch.load(path, map_location=device)
+    q_state = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    q_model.load_state_dict(_strip_module_prefix(q_state), strict=True)
+    if isinstance(checkpoint, dict) and 'k_model_state_dict' in checkpoint:
+        k_model.load_state_dict(_strip_module_prefix(checkpoint['k_model_state_dict']), strict=True)
+    else:
+        k_model.load_state_dict(q_model.state_dict(), strict=True)
+    for param_k in k_model.parameters():
+        param_k.requires_grad = False
+    return checkpoint if isinstance(checkpoint, dict) else None
+
+
+def load_eg_pssm_resume_state(eg_pssm_module, checkpoint, logger):
+    if eg_pssm_module is None or checkpoint is None:
+        return
+    if 'eg_pssm_state_dict' in checkpoint:
+        # 续跑 EG-PSSM 实验时恢复 SSM 分支；warm-start Jo-SNC checkpoint 没有该字段则保持新初始化。
+        eg_pssm_module.load_state_dict(checkpoint['eg_pssm_state_dict'], strict=True)
+    else:
+        logger.debug('EG-PSSM state is not found in checkpoint; initialize EG-PSSM from scratch.')
+
+
+def _strip_module_prefix(state_dict):
+    if not isinstance(state_dict, dict):
+        return state_dict
+    if not any(str(key).startswith('module.') for key in state_dict.keys()):
+        return state_dict
+    return {str(key)[7:]: value for key, value in state_dict.items()}
 
 
 def build_dataset(cfg):
@@ -388,12 +455,27 @@ def main(gpu, cfg):
     # model
     q_model = DualHeadModel(arch=cfg.arch, num_classes=cfg.n_classes, mlp_hidden=cfg.hdim, feature_dim=cfg.fdim, pretrained=True, use_bn=True).to(device)
     k_model = DualHeadModel(arch=cfg.arch, num_classes=cfg.n_classes, mlp_hidden=cfg.hdim, feature_dim=cfg.fdim, pretrained=True, use_bn=True).to(device)
+    eg_pssm_module = None
+    if cfg.eg_pssm:
+        # EG-PSSM 接在 raw backbone feature 空间，保持和现有 classifier 输入分布一致。
+        eg_pssm_module = EGPSSMModule(
+            feature_dim=q_model.encoder.feature_dim,
+            num_parts=cfg.eg_pssm_num_parts,
+            backend=cfg.eg_pssm_backend,
+            use_diff_token=cfg.eg_pssm_use_diff_token,
+            gate_mode=cfg.eg_pssm_gate_mode,
+            gate_min=cfg.eg_pssm_gate_min,
+            lambda_init=cfg.eg_pssm_lambda_init,
+            bidirectional=cfg.eg_pssm_bidirectional,
+            sort_parts=cfg.eg_pssm_sort_parts,
+        ).to(device)
     for param_q, param_k in zip(q_model.parameters(), k_model.parameters()):
         param_k.data.copy_(param_q.data)  # initialize
         param_k.requires_grad = False     # not update by gradient
 
     # optimizer, scheduler
-    optim = build_optimizer(cfg, q_model.parameters())
+    optim_params = build_eg_pssm_param_groups(q_model, eg_pssm_module) if cfg.eg_pssm else q_model.parameters()
+    optim = build_optimizer(cfg, optim_params)
     lr_plan = build_lr_plan(cfg.lr, cfg.epochs, cfg.warmup_epochs, cfg.warmup_lr, cfg.lr_decay)  #, warmup_rampup=(cfg.warmup_lr_plan != 'constant'))
 
     # dataset, dataloader
@@ -421,6 +503,8 @@ def main(gpu, cfg):
     save_network_arch(result_dir, q_model)
     logger.msg(f'Result Path   : {result_dir}')
     logger.msg(f"# of training data: {n_train_samples}, # of test data: {dataset['n_test_samples']}")
+    if eg_pssm_module is not None:
+        logger.msg(f'EG-PSSM backend: {eg_pssm_module.actual_backend}')
 
     threshold_writer = Writer(root_dir=result_dir, filename='threshold.csv', header='epoch,threshold_clean,threshold_ood')
     pr_metric_writer = Writer(root_dir=result_dir, filename='prfa_metric.csv', header='epoch,N,P,R,F1,AUROC,N,P,R,F1,AUROC,N,P,R,F1,AUROC')
@@ -628,6 +712,41 @@ def main(gpu, cfg):
             )
         if not (0.0 <= cfg.multi_part_iou_thr <= 1.0):
             raise ValueError(f'multi_part_iou_thr should be within [0, 1], got {cfg.multi_part_iou_thr}.')
+    if cfg.eg_pssm:
+        # clean-only v1 只验证 SSM-style 部件关系建模，不和已有局部分支或 ID/OOD 分支混合。
+        if (
+            cfg.part_ce or cfg.local_margin or cfg.part_consistency or cfg.erase_consistency
+            or cfg.evidence_clean_reweight or cfg.id_candidate or cfg.multi_part or cfg.d2_diag
+            or cfg.evidence_proto_align or cfg.normal_proto_align
+        ):
+            raise ValueError(
+                'EG-PSSM clean-only v1 should run alone: disable part_ce/local_margin/'
+                'part_consistency/erase_consistency/E1/C2/D1/D2/prototype branches.'
+            )
+        if not cfg.eg_pssm_clean_only:
+            raise ValueError('EG-PSSM v1 requires eg_pssm_clean_only=true.')
+        if cfg.eg_pssm_backend not in ['auto', 'mamba', 'torch_ssm']:
+            raise ValueError(f'eg_pssm_backend should be auto, mamba, or torch_ssm, got {cfg.eg_pssm_backend}.')
+        if cfg.eg_pssm_num_parts < 1:
+            raise ValueError(f'eg_pssm_num_parts should be >= 1, got {cfg.eg_pssm_num_parts}.')
+        if cfg.eg_pssm_gate_mode not in ['continuous', 'none', 'off', 'no_gate']:
+            raise ValueError(f'eg_pssm_gate_mode should be continuous or none, got {cfg.eg_pssm_gate_mode}.')
+        if not (0.0 <= cfg.eg_pssm_gate_min <= 1.0):
+            raise ValueError(f'eg_pssm_gate_min should be within [0, 1], got {cfg.eg_pssm_gate_min}.')
+        if cfg.eg_pssm_loss_weight < 0.0:
+            raise ValueError(f'eg_pssm_loss_weight should be non-negative, got {cfg.eg_pssm_loss_weight}.')
+        if cfg.eg_pssm_start_epoch < 0:
+            raise ValueError(f'eg_pssm_start_epoch should be non-negative, got {cfg.eg_pssm_start_epoch}.')
+        if cfg.eg_pssm_lambda_init < 0.0:
+            raise ValueError(f'eg_pssm_lambda_init should be non-negative, got {cfg.eg_pssm_lambda_init}.')
+        if cfg.eg_pssm_sort_parts not in ['evidence_desc', 'none', 'original']:
+            raise ValueError(f'eg_pssm_sort_parts should be evidence_desc or none, got {cfg.eg_pssm_sort_parts}.')
+        if cfg.eg_pssm_crop_mode not in ['bbox', 'peak_window']:
+            raise ValueError(f'eg_pssm_crop_mode should be bbox or peak_window, got {cfg.eg_pssm_crop_mode}.')
+        if cfg.eg_pssm_erase_mode not in ['cam_mask', 'bbox', 'peak_window']:
+            raise ValueError(f'eg_pssm_erase_mode should be cam_mask, bbox, or peak_window, got {cfg.eg_pssm_erase_mode}.')
+        if not (0.0 < cfg.eg_pssm_window_ratio <= 1.0):
+            raise ValueError(f'eg_pssm_window_ratio should be within (0, 1], got {cfg.eg_pssm_window_ratio}.')
     prototype_enabled = cfg.evidence_proto_align or cfg.normal_proto_align
     if cfg.evidence_proto_align and cfg.normal_proto_align:
         raise ValueError('EAPA and normal prototype should be run in separate experiments.')
@@ -808,6 +927,10 @@ def main(gpu, cfg):
             filename='d2_diag_samples.csv',
             header=D2_DIAG_SAMPLE_CSV_HEADER,
         )
+    eg_pssm_writer = None
+    if cfg.eg_pssm and cfg.eg_pssm_log:
+        # EG-PSSM 单独记录 final prediction 相对 global prediction 的训练子集变化。
+        eg_pssm_writer = Writer(root_dir=result_dir, filename='eg_pssm.csv', header=EG_PSSM_CSV_HEADER)
     evidence_proto_writer = None
     if prototype_enabled and ((cfg.evidence_proto_align and cfg.evidence_proto_log) or (cfg.normal_proto_align and cfg.normal_proto_log)):
         # EAPA/normal prototype 共用 CSV，记录 prototype softmax、更新权重和 bank 覆盖率。
@@ -824,6 +947,7 @@ def main(gpu, cfg):
 
     # resume from checkpoint
     resume_checkpoint = None
+    warm_start_checkpoint = None
     if 'ckpt_path' in cfg.keys() and cfg.ckpt_path is not None and os.path.isfile(cfg.ckpt_path):
         logger.debug(f'---> loading {cfg.ckpt_path} <---')
         checkpoint = torch.load(cfg.ckpt_path, map_location=f'cuda:{gpu}')
@@ -837,7 +961,12 @@ def main(gpu, cfg):
         best_accuracy = checkpoint['best_accuracy']
         best_epoch = checkpoint['best_epoch']
         resume_checkpoint = checkpoint
+        load_eg_pssm_resume_state(eg_pssm_module, checkpoint, logger)
     else:
+        if cfg.eg_pssm:
+            warm_start_checkpoint = load_eg_pssm_warm_start(
+                cfg.eg_pssm_init_ckpt_path, q_model, k_model, device, logger
+            )
         start_epoch = 0
         best_accuracy = 0.0
         best_epoch = None
@@ -878,6 +1007,17 @@ def main(gpu, cfg):
         if prototype_state is not None:
             # 续跑必须恢复 prototype bank，否则 epoch30 后的 proto loss 会读取到空 bank。
             load_prototype_state(prototype_state, resume_checkpoint, device)
+    if resume_checkpoint is None and warm_start_checkpoint is not None:
+        # warm-start 只借用 Jo-SNC 表征、EMA 与队列状态；epoch/optimizer/scaler 重新开始。
+        if 'queue_keys' in warm_start_checkpoint:
+            queue_keys = warm_start_checkpoint['queue_keys'].to(device)
+        if 'queue_logits' in warm_start_checkpoint:
+            queue_logits = warm_start_checkpoint['queue_logits'].to(device)
+        queue_ptr = warm_start_checkpoint.get('queue_ptr', queue_ptr)
+        if 'tau_c' in warm_start_checkpoint:
+            tau_c = warm_start_checkpoint['tau_c'].to(device)
+        if 'tau_o' in warm_start_checkpoint:
+            tau_o = warm_start_checkpoint['tau_o'].to(device)
     for epoch in range(start_epoch, cfg.epochs):
         if cfg.warmup_fc_only:
             if epoch < cfg.warmup_epochs:
@@ -919,9 +1059,14 @@ def main(gpu, cfg):
             ob_labels = get_smoothed_label_distribution(y, cfg.n_classes, cfg.eps)  # > (bs, nc)
             onehot_labels = F.one_hot(y, cfg.n_classes).float()
             bs = x1.size(0)
+            eg_pssm_pending_row = None
 
             with autocast(cfg.use_fp16):
-                logits1, feat1 = q_model(x1)
+                if cfg.eg_pssm:
+                    logits1, feat1, raw_feat1 = q_model(x1, return_raw=True)
+                else:
+                    logits1, feat1 = q_model(x1)
+                    raw_feat1 = None
                 logits2, feat2 = q_model(x2)
                 q = feat1
                 probs1, probs2 = F.softmax(logits1, dim=1), F.softmax(logits2, dim=1)
@@ -1157,6 +1302,73 @@ def main(gpu, cfg):
                     # final loss
                     loss = loss_cls + cfg.alpha * loss_con_pred + cfg.gamma * loss_con_feat + cfg.beta * loss_ncr
                     josnc_loss = loss
+
+                    if cfg.eg_pssm and (epoch + 1) >= cfg.eg_pssm_start_epoch:
+                        # EG-PSSM 只在 Jo-SNC strict clean 样本上构造多部位 token；ID/OOD 不进入该 loss。
+                        eg_part_batch = {'num_selected': int(idx_clean.numel()), 'num_valid': 0}
+                        if idx_clean.numel() > 0:
+                            eg_part_batch = build_eg_pssm_part_batch(
+                                k_model, x1, y, idx_clean,
+                                num_parts=cfg.eg_pssm_num_parts,
+                                use_accum_erase=cfg.eg_pssm_use_accum_erase,
+                                crop_mode=cfg.eg_pssm_crop_mode,
+                                window_ratio=cfg.eg_pssm_window_ratio,
+                                erase_mode=cfg.eg_pssm_erase_mode,
+                                cam_quantile=cfg.local_evidence_cam_quantile,
+                                min_area=cfg.local_evidence_min_area,
+                                max_area=cfg.local_evidence_max_area,
+                                bbox_padding=cfg.local_evidence_bbox_padding,
+                                cam_type=cfg.local_evidence_cam_type,
+                            )
+                        if int(eg_part_batch.get('num_valid', 0)) > 0:
+                            valid_sample_mask = eg_part_batch['valid_sample_mask'].to(device=x1.device, dtype=torch.bool)
+                            enabled_positions = eg_part_batch['batch_indices'][valid_sample_mask]
+                            enabled_labels = eg_part_batch['labels'][valid_sample_mask]
+                            x_part_enabled = eg_part_batch['x_part'][valid_sample_mask]
+                            x_erase_enabled = eg_part_batch['x_erase'][valid_sample_mask]
+                            num_enabled, num_parts = x_part_enabled.size(0), x_part_enabled.size(1)
+
+                            # part/erase raw feature 直接来自 student encoder，不走 projector/normalize。
+                            x_part_flat = x_part_enabled.reshape(-1, *x_part_enabled.shape[2:])
+                            x_erase_flat = x_erase_enabled.reshape(-1, *x_erase_enabled.shape[2:])
+                            z_part = q_model.encoder(x_part_flat).view(num_enabled, num_parts, -1)
+                            z_erase = q_model.encoder(x_erase_flat).view(num_enabled, num_parts, -1)
+                            z_global = raw_feat1[enabled_positions]
+                            enabled_evidence = eg_part_batch['evidence'][valid_sample_mask]
+                            enabled_valid_parts = eg_part_batch['valid_part_mask'][valid_sample_mask]
+                            eg_output = eg_pssm_module(
+                                z_global, z_part, z_erase,
+                                enabled_evidence, valid_part_mask=enabled_valid_parts
+                            )
+                            if num_enabled == 1:
+                                bn_states = _set_batchnorm_eval(q_model.classifier)
+                                try:
+                                    final_logits = q_model.classifier(eg_output['z_final'])
+                                finally:
+                                    _restore_module_training_states(bn_states)
+                            else:
+                                final_logits = q_model.classifier(eg_output['z_final'])
+                            eg_pssm_sample_loss = F.cross_entropy(final_logits, enabled_labels, reduction='none')
+                            eg_pssm_loss = (eg_output['gate'].detach() * eg_pssm_sample_loss).mean()
+                            loss = loss + cfg.eg_pssm_loss_weight * eg_pssm_loss
+                            eg_pssm_pending_row = build_eg_pssm_log_row(
+                                epoch + 1, it, eg_pssm_module.actual_backend,
+                                eg_pssm_module.lambda_ssm, int(idx_clean.numel()), bs,
+                                labels=enabled_labels,
+                                global_logits=logits1[enabled_positions],
+                                final_logits=final_logits,
+                                gate=eg_output['gate'],
+                                evidence=enabled_evidence,
+                                z_global=z_global,
+                                z_final=eg_output['z_final'],
+                                z_ssm=eg_output['z_ssm'],
+                                residual=eg_output['residual'],
+                            )
+                        else:
+                            eg_pssm_pending_row = build_eg_pssm_log_row(
+                                epoch + 1, it, eg_pssm_module.actual_backend,
+                                eg_pssm_module.lambda_ssm, int(idx_clean.numel()), bs,
+                            )
 
                     if clean_part_batch['num_valid'] > 0 and 'gate_mask' in clean_part_batch:
                         gate_mask = clean_part_batch['gate_mask'].to(device=x1.device, dtype=torch.bool)
@@ -1618,6 +1830,11 @@ def main(gpu, cfg):
                 queue_ptr = (queue_ptr + bs) % cfg.queue_length
 
             scaler.scale(loss).backward()
+            if eg_pssm_writer is not None and eg_pssm_pending_row is not None:
+                # 写 CSV 前先 unscale，确保 lambda/SSM 梯度范数是真实尺度。
+                scaler.unscale_(optim)
+                update_eg_pssm_grad_fields(eg_pssm_pending_row, eg_pssm_module)
+                eg_pssm_writer.write(format_eg_pssm_row(eg_pssm_pending_row))
             scaler.step(optim)
             scaler.update()
             optim.zero_grad()
@@ -1680,6 +1897,7 @@ def main(gpu, cfg):
                 'tau_o': tau_o.detach().cpu(),
                 'best_epoch': best_epoch,
                 'best_accuracy': best_accuracy,
+                **eg_pssm_checkpoint_items(eg_pssm_module),
                 **prototype_checkpoint_items(prototype_state)
             }, filename=os.path.join(result_dir, f'checkpoint-{ckpt_file_suffix}.pth'))
 
@@ -1828,7 +2046,13 @@ def check_args(args):
         'normal_proto_loss_type', 'normal_proto_temp', 'normal_proto_weight',
         'normal_proto_num_subproto', 'normal_proto_class_logit_pool',
         'normal_proto_update_assign', 'normal_proto_init_policy',
-        'normal_proto_log'
+        'normal_proto_log',
+        'eg_pssm', 'eg_pssm_backend', 'eg_pssm_num_parts',
+        'eg_pssm_use_diff_token', 'eg_pssm_gate_mode', 'eg_pssm_gate_min',
+        'eg_pssm_loss_weight', 'eg_pssm_start_epoch', 'eg_pssm_lambda_init',
+        'eg_pssm_bidirectional', 'eg_pssm_sort_parts', 'eg_pssm_clean_only',
+        'eg_pssm_log', 'eg_pssm_init_ckpt_path', 'eg_pssm_use_accum_erase',
+        'eg_pssm_crop_mode', 'eg_pssm_window_ratio', 'eg_pssm_erase_mode'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -2147,6 +2371,44 @@ def parse_args():
     parser.add_argument('--multi-part-iou-thr', type=float, default=None,
                         help='D2_diag IoU 去重阈值。')
 
+    # EG-PSSM clean-only v1：只在 strict clean + valid parts 子集上学习 final prediction residual。
+    parser.add_argument('--eg-pssm', action=argparse.BooleanOptionalAction, default=None,
+                        help='开启 EG-PSSM clean-only v1 分支。')
+    parser.add_argument('--eg-pssm-backend', type=str, default=None,
+                        help='EG-PSSM 后端：auto、mamba 或 torch_ssm。')
+    parser.add_argument('--eg-pssm-num-parts', type=int, default=None,
+                        help='EG-PSSM 每个 clean 样本顺序生成的 part 数。')
+    parser.add_argument('--eg-pssm-use-diff-token', action=argparse.BooleanOptionalAction, default=None,
+                        help='part token 是否包含 f_part - f_erase。')
+    parser.add_argument('--eg-pssm-gate-mode', type=str, default=None,
+                        help='EG-PSSM gate 模式：continuous 或 none。')
+    parser.add_argument('--eg-pssm-gate-min', type=float, default=None,
+                        help='continuous gate 的最小值。')
+    parser.add_argument('--eg-pssm-loss-weight', type=float, default=None,
+                        help='EG-PSSM CE loss 权重。')
+    parser.add_argument('--eg-pssm-start-epoch', type=int, default=None,
+                        help='从第几个用户可见 epoch 开始启用 EG-PSSM。')
+    parser.add_argument('--eg-pssm-lambda-init', type=float, default=None,
+                        help='EG-PSSM residual lambda 初始值。')
+    parser.add_argument('--eg-pssm-bidirectional', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否启用双向 SSM token 建模。')
+    parser.add_argument('--eg-pssm-sort-parts', type=str, default=None,
+                        help='part token 排序方式：evidence_desc 或 none。')
+    parser.add_argument('--eg-pssm-clean-only', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否限制 EG-PSSM 只使用 strict clean 样本。')
+    parser.add_argument('--eg-pssm-log', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否写出 eg_pssm.csv。')
+    parser.add_argument('--eg-pssm-init-ckpt-path', type=str, default=None,
+                        help='从 Jo-SNC checkpoint warm-start q/k model 和队列，不恢复 optimizer。')
+    parser.add_argument('--eg-pssm-use-accum-erase', action=argparse.BooleanOptionalAction, default=None,
+                        help='多 part CAM 是否使用累计擦除图。')
+    parser.add_argument('--eg-pssm-crop-mode', type=str, default=None,
+                        help='EG-PSSM part crop 方式：bbox 或 peak_window。')
+    parser.add_argument('--eg-pssm-window-ratio', type=float, default=None,
+                        help='peak_window 边长比例。')
+    parser.add_argument('--eg-pssm-erase-mode', type=str, default=None,
+                        help='下一轮 CAM 与 diff token 的擦除区域：cam_mask、bbox 或 peak_window。')
+
     # EAPA：用局部证据做 prototype update 软权重，再用 prototype softmax 约束全图特征。
     parser.add_argument('--evidence-proto-align', action=argparse.BooleanOptionalAction, default=None,
                         help='开启 EAPA evidence-weighted prototype softmax 分支。')
@@ -2333,6 +2595,25 @@ def parse_args():
     args.setdefault('multi_part_iou_filter', True)
     args.setdefault('multi_part_iou_thr', 0.5)
     # EAPA 默认关闭；开启后只用 C1 evidence 作为 prototype update 软权重，不启用局部 CE。
+    # EG-PSSM clean-only v1 默认关闭；开启后只在 clean 样本上加 final residual loss。
+    args.setdefault('eg_pssm', False)
+    args.setdefault('eg_pssm_backend', 'auto')
+    args.setdefault('eg_pssm_num_parts', 3)
+    args.setdefault('eg_pssm_use_diff_token', True)
+    args.setdefault('eg_pssm_gate_mode', 'continuous')
+    args.setdefault('eg_pssm_gate_min', 0.05)
+    args.setdefault('eg_pssm_loss_weight', 0.2)
+    args.setdefault('eg_pssm_start_epoch', 20)
+    args.setdefault('eg_pssm_lambda_init', 0.001)
+    args.setdefault('eg_pssm_bidirectional', True)
+    args.setdefault('eg_pssm_sort_parts', 'evidence_desc')
+    args.setdefault('eg_pssm_clean_only', True)
+    args.setdefault('eg_pssm_log', True)
+    args.setdefault('eg_pssm_init_ckpt_path', None)
+    args.setdefault('eg_pssm_use_accum_erase', True)
+    args.setdefault('eg_pssm_crop_mode', 'peak_window')
+    args.setdefault('eg_pssm_window_ratio', 0.35)
+    args.setdefault('eg_pssm_erase_mode', 'peak_window')
     args.setdefault('evidence_proto_align', False)
     args.setdefault('evidence_proto_groups', 'clean')
     args.setdefault('evidence_proto_require_c1_gate', False)
@@ -2400,6 +2681,11 @@ def parse_args():
     args['d2_diag_groups'] = str(args['d2_diag_groups']).strip().lower()
     args['multi_part_quality_metric'] = str(args['multi_part_quality_metric']).lower()
     args['multi_part_quality_gate_type'] = str(args['multi_part_quality_gate_type']).lower()
+    args['eg_pssm_backend'] = str(args['eg_pssm_backend']).strip().lower()
+    args['eg_pssm_gate_mode'] = str(args['eg_pssm_gate_mode']).strip().lower()
+    args['eg_pssm_sort_parts'] = str(args['eg_pssm_sort_parts']).strip().lower()
+    args['eg_pssm_crop_mode'] = str(args['eg_pssm_crop_mode']).strip().lower()
+    args['eg_pssm_erase_mode'] = str(args['eg_pssm_erase_mode']).strip().lower()
     args['evidence_proto_groups'] = str(args['evidence_proto_groups']).strip().lower()
     args['evidence_proto_feature'] = str(args['evidence_proto_feature']).strip().lower()
     args['evidence_proto_init'] = str(args['evidence_proto_init']).strip().lower()
