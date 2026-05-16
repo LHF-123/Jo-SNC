@@ -22,6 +22,7 @@ import torch.nn.functional as F
 import torchvision
 import yaml
 import shutil
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from datetime import datetime
@@ -230,14 +231,22 @@ def _strip_module_prefix(state_dict):
     return {str(key)[7:]: value for key, value in state_dict.items()}
 
 
-def forward_encoder_in_chunks(encoder, images, chunk_size):
+def forward_encoder_in_chunks(encoder, images, chunk_size, use_checkpoint=False):
     # EG-PSSM part/erase 辅助前向可能远大于原始 batch；分块送入 encoder 降低瞬时显存峰值。
     chunk_size = int(chunk_size)
+    use_checkpoint = bool(use_checkpoint)
     if chunk_size <= 0 or images.size(0) <= chunk_size:
+        if use_checkpoint and torch.is_grad_enabled() and images.requires_grad:
+            # checkpoint 通过反向重算 encoder 激活来降显存，保留对 backbone 的梯度。
+            return checkpoint(encoder, images, use_reentrant=False)
         return encoder(images)
     feature_chunks = []
     for start in range(0, images.size(0), chunk_size):
-        feature_chunks.append(encoder(images[start:start + chunk_size]))
+        chunk = images[start:start + chunk_size]
+        if use_checkpoint and torch.is_grad_enabled() and chunk.requires_grad:
+            feature_chunks.append(checkpoint(encoder, chunk, use_reentrant=False))
+        else:
+            feature_chunks.append(encoder(chunk))
     return torch.cat(feature_chunks, dim=0)
 
 
@@ -1346,11 +1355,16 @@ def main(gpu, cfg):
                             # part/erase raw feature 直接来自 student encoder，不走 projector/normalize。
                             x_part_flat = x_part_enabled.reshape(-1, *x_part_enabled.shape[2:])
                             x_erase_flat = x_erase_enabled.reshape(-1, *x_erase_enabled.shape[2:])
+                            if cfg.eg_pssm_feature_checkpoint:
+                                x_part_flat = x_part_flat.detach().requires_grad_(True)
+                                x_erase_flat = x_erase_flat.detach().requires_grad_(True)
                             z_part_flat = forward_encoder_in_chunks(
-                                q_model.encoder, x_part_flat, cfg.eg_pssm_feature_chunk_size
+                                q_model.encoder, x_part_flat, cfg.eg_pssm_feature_chunk_size,
+                                use_checkpoint=cfg.eg_pssm_feature_checkpoint,
                             )
                             z_erase_flat = forward_encoder_in_chunks(
-                                q_model.encoder, x_erase_flat, cfg.eg_pssm_feature_chunk_size
+                                q_model.encoder, x_erase_flat, cfg.eg_pssm_feature_chunk_size,
+                                use_checkpoint=cfg.eg_pssm_feature_checkpoint,
                             )
                             z_part = z_part_flat.view(num_enabled, num_parts, -1)
                             z_erase = z_erase_flat.view(num_enabled, num_parts, -1)
@@ -2074,7 +2088,7 @@ def check_args(args):
         'eg_pssm_bidirectional', 'eg_pssm_sort_parts', 'eg_pssm_clean_only',
         'eg_pssm_log', 'eg_pssm_init_ckpt_path', 'eg_pssm_use_accum_erase',
         'eg_pssm_crop_mode', 'eg_pssm_window_ratio', 'eg_pssm_erase_mode',
-        'eg_pssm_feature_chunk_size'
+        'eg_pssm_feature_chunk_size', 'eg_pssm_feature_checkpoint'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -2432,6 +2446,8 @@ def parse_args():
                         help='下一轮 CAM 与 diff token 的擦除区域：cam_mask、bbox 或 peak_window。')
     parser.add_argument('--eg-pssm-feature-chunk-size', type=int, default=None,
                         help='EG-PSSM part/erase raw feature 前向的分块大小；0 表示不分块。')
+    parser.add_argument('--eg-pssm-feature-checkpoint', action=argparse.BooleanOptionalAction, default=None,
+                        help='是否对 EG-PSSM part/erase encoder 前向启用 activation checkpoint。')
 
     # EAPA：用局部证据做 prototype update 软权重，再用 prototype softmax 约束全图特征。
     parser.add_argument('--evidence-proto-align', action=argparse.BooleanOptionalAction, default=None,
@@ -2638,7 +2654,8 @@ def parse_args():
     args.setdefault('eg_pssm_crop_mode', 'peak_window')
     args.setdefault('eg_pssm_window_ratio', 0.35)
     args.setdefault('eg_pssm_erase_mode', 'peak_window')
-    args.setdefault('eg_pssm_feature_chunk_size', 16)
+    args.setdefault('eg_pssm_feature_chunk_size', 4)
+    args.setdefault('eg_pssm_feature_checkpoint', True)
     args.setdefault('evidence_proto_align', False)
     args.setdefault('evidence_proto_groups', 'clean')
     args.setdefault('evidence_proto_require_c1_gate', False)
