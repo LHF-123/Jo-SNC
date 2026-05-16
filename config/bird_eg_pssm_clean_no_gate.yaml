@@ -80,6 +80,7 @@ eg_pssm_use_accum_erase: true
 eg_pssm_crop_mode: peak_window
 eg_pssm_window_ratio: 0.35
 eg_pssm_erase_mode: peak_window
+eg_pssm_feature_chunk_size: 16
 
 # logging
 log_root: ./results/

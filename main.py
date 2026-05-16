@@ -230,6 +230,17 @@ def _strip_module_prefix(state_dict):
     return {str(key)[7:]: value for key, value in state_dict.items()}
 
 
+def forward_encoder_in_chunks(encoder, images, chunk_size):
+    # EG-PSSM part/erase 辅助前向可能远大于原始 batch；分块送入 encoder 降低瞬时显存峰值。
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0 or images.size(0) <= chunk_size:
+        return encoder(images)
+    feature_chunks = []
+    for start in range(0, images.size(0), chunk_size):
+        feature_chunks.append(encoder(images[start:start + chunk_size]))
+    return torch.cat(feature_chunks, dim=0)
+
+
 def build_dataset(cfg):
     transform = build_transform(cfg.rescale_size, cfg.crop_size, dataset=cfg.dataset)
     if cfg.dataset.startswith('cifar100n'):
@@ -747,6 +758,10 @@ def main(gpu, cfg):
             raise ValueError(f'eg_pssm_erase_mode should be cam_mask, bbox, or peak_window, got {cfg.eg_pssm_erase_mode}.')
         if not (0.0 < cfg.eg_pssm_window_ratio <= 1.0):
             raise ValueError(f'eg_pssm_window_ratio should be within (0, 1], got {cfg.eg_pssm_window_ratio}.')
+        if cfg.eg_pssm_feature_chunk_size < 0:
+            raise ValueError(
+                f'eg_pssm_feature_chunk_size should be non-negative, got {cfg.eg_pssm_feature_chunk_size}.'
+            )
     prototype_enabled = cfg.evidence_proto_align or cfg.normal_proto_align
     if cfg.evidence_proto_align and cfg.normal_proto_align:
         raise ValueError('EAPA and normal prototype should be run in separate experiments.')
@@ -1331,8 +1346,14 @@ def main(gpu, cfg):
                             # part/erase raw feature 直接来自 student encoder，不走 projector/normalize。
                             x_part_flat = x_part_enabled.reshape(-1, *x_part_enabled.shape[2:])
                             x_erase_flat = x_erase_enabled.reshape(-1, *x_erase_enabled.shape[2:])
-                            z_part = q_model.encoder(x_part_flat).view(num_enabled, num_parts, -1)
-                            z_erase = q_model.encoder(x_erase_flat).view(num_enabled, num_parts, -1)
+                            z_part_flat = forward_encoder_in_chunks(
+                                q_model.encoder, x_part_flat, cfg.eg_pssm_feature_chunk_size
+                            )
+                            z_erase_flat = forward_encoder_in_chunks(
+                                q_model.encoder, x_erase_flat, cfg.eg_pssm_feature_chunk_size
+                            )
+                            z_part = z_part_flat.view(num_enabled, num_parts, -1)
+                            z_erase = z_erase_flat.view(num_enabled, num_parts, -1)
                             z_global = raw_feat1[enabled_positions]
                             enabled_evidence = eg_part_batch['evidence'][valid_sample_mask]
                             enabled_valid_parts = eg_part_batch['valid_part_mask'][valid_sample_mask]
@@ -2052,7 +2073,8 @@ def check_args(args):
         'eg_pssm_loss_weight', 'eg_pssm_start_epoch', 'eg_pssm_lambda_init',
         'eg_pssm_bidirectional', 'eg_pssm_sort_parts', 'eg_pssm_clean_only',
         'eg_pssm_log', 'eg_pssm_init_ckpt_path', 'eg_pssm_use_accum_erase',
-        'eg_pssm_crop_mode', 'eg_pssm_window_ratio', 'eg_pssm_erase_mode'
+        'eg_pssm_crop_mode', 'eg_pssm_window_ratio', 'eg_pssm_erase_mode',
+        'eg_pssm_feature_chunk_size'
     ]
     invalid_arg_items = []
     for k in args.keys():
@@ -2408,6 +2430,8 @@ def parse_args():
                         help='peak_window 边长比例。')
     parser.add_argument('--eg-pssm-erase-mode', type=str, default=None,
                         help='下一轮 CAM 与 diff token 的擦除区域：cam_mask、bbox 或 peak_window。')
+    parser.add_argument('--eg-pssm-feature-chunk-size', type=int, default=None,
+                        help='EG-PSSM part/erase raw feature 前向的分块大小；0 表示不分块。')
 
     # EAPA：用局部证据做 prototype update 软权重，再用 prototype softmax 约束全图特征。
     parser.add_argument('--evidence-proto-align', action=argparse.BooleanOptionalAction, default=None,
@@ -2614,6 +2638,7 @@ def parse_args():
     args.setdefault('eg_pssm_crop_mode', 'peak_window')
     args.setdefault('eg_pssm_window_ratio', 0.35)
     args.setdefault('eg_pssm_erase_mode', 'peak_window')
+    args.setdefault('eg_pssm_feature_chunk_size', 16)
     args.setdefault('evidence_proto_align', False)
     args.setdefault('evidence_proto_groups', 'clean')
     args.setdefault('evidence_proto_require_c1_gate', False)

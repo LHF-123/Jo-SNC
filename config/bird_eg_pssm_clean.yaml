@@ -1,5 +1,6 @@
 # dataset
 data_root: /root/autodl-tmp/
+# data_root:/home/Jo-SNC/dataset
 dataset: web-bird
 n_classes: 200
 rescale_size: 448
@@ -8,12 +9,12 @@ crop_size: 448
 # network & optimization
 arch: resnet50
 opt: sgd
-batch_size: 56
+batch_size: 52
 epochs: 120
-lr: 0.00875
+lr: 0.008125
 lr_decay: cosine:10
 warmup_epochs: 5
-warmup_lr: 0.00875
+warmup_lr: 0.008125
 warmup_lr_plan: constant
 weight_decay: 1.0e-5
 use_fp16: True
@@ -80,6 +81,7 @@ eg_pssm_use_accum_erase: true
 eg_pssm_crop_mode: peak_window
 eg_pssm_window_ratio: 0.35
 eg_pssm_erase_mode: peak_window
+eg_pssm_feature_chunk_size: 16
 
 # logging
 log_root: ./results/
